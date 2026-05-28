@@ -54,6 +54,12 @@ BREV_DOWNLOAD_RETRIES = int(os.environ.get("BREV_DOWNLOAD_RETRIES", "3"))
 BREV_DOWNLOAD_BACKOFF_SEC = float(os.environ.get("BREV_DOWNLOAD_BACKOFF_SEC", "5"))
 
 
+def _uses_nemoclaw(meta: dict) -> bool:
+    """Return True when task metadata opts into the NemoClaw runner."""
+    runner = str(meta.get("runner", "")).strip().lower()
+    return runner == "nemoclaw" or bool(meta.get("requires_nemoclaw"))
+
+
 class BrevEnvironmentType(str, Enum):
     BREV = "brev"
 
@@ -320,41 +326,48 @@ class BrevEnvironment(BaseEnvironment):
         # PR_HEAD_SHA forwarded above never actually lands on disk.
         await self._sync_repo_to_pr_head()
 
-        # Wipe the warm-pool box's docker runtime to a clean slate so no
-        # prior trial's deployment state can contaminate this one. Images are
-        # preserved (re-pulling the image set is slow); all containers,
-        # user-defined networks, and volumes are removed. See
-        # _reset_docker_runtime for why this is blanket, not VSS-scoped.
-        #
-        # Gate: ONLY on a spec's first trial — a single-step spec (task dir is
-        # the platform, e.g. `rtxpro6000bw`) or `step-1` of a multi-step spec.
-        # Multi-step checks for step N assume the deployment state established
-        # by step N-1 (AGENTS.md § "Multi-step specs"), and each step is a
-        # separate `harbor run` → separate start(); resetting before step-2+
-        # would destroy the very state under test. step-1 gets the clean box;
-        # later steps build on it. (`environment_dir.parent` is the task dir —
-        # named `step-N` for multi-step, the platform for single-step.)
-        # Caveat: a manual `harbor run` targeting only `step-2+` in isolation
-        # skips the reset and inherits whatever is on the box — run `step-1`
-        # first, or reset by hand. Normal CI always runs `step-1` first on a
-        # freshly reset box, so the gate is correct there.
-        task_dir_name = self.environment_dir.parent.name
-        if task_dir_name.startswith("step-") and task_dir_name != "step-1":
-            logger.info(
-                "Skipping docker runtime reset on %s — %s of a multi-step spec "
-                "must preserve step-1's deployment state",
-                self._instance_name, task_dir_name,
-            )
-        else:
+        if _uses_nemoclaw(meta):
+            # NemoClaw trials need a clean VSS host first, then an OpenClaw
+            # sandbox. Reset Docker before notebook setup creates the
+            # OpenClaw/NemoClaw containers.
             await self._reset_docker_runtime()
+            await self._ensure_nemoclaw_ready(meta)
+        else:
+            # Wipe the warm-pool box's docker runtime to a clean slate so no
+            # prior trial's deployment state can contaminate this one. Images are
+            # preserved (re-pulling the image set is slow); all containers,
+            # user-defined networks, and volumes are removed. See
+            # _reset_docker_runtime for why this is blanket, not VSS-scoped.
+            #
+            # Gate: ONLY on a spec's first trial — a single-step spec (task dir is
+            # the platform, e.g. `rtxpro6000bw`) or `step-1` of a multi-step spec.
+            # Multi-step checks for step N assume the deployment state established
+            # by step N-1 (AGENTS.md § "Multi-step specs"), and each step is a
+            # separate `harbor run` → separate start(); resetting before step-2+
+            # would destroy the very state under test. step-1 gets the clean box;
+            # later steps build on it. (`environment_dir.parent` is the task dir —
+            # named `step-N` for multi-step, the platform for single-step.)
+            # Caveat: a manual `harbor run` targeting only `step-2+` in isolation
+            # skips the reset and inherits whatever is on the box — run `step-1`
+            # first, or reset by hand. Normal CI always runs `step-1` first on a
+            # freshly reset box, so the gate is correct there.
+            task_dir_name = self.environment_dir.parent.name
+            if task_dir_name.startswith("step-") and task_dir_name != "step-1":
+                logger.info(
+                    "Skipping docker runtime reset on %s — %s of a multi-step spec "
+                    "must preserve step-1's deployment state",
+                    self._instance_name, task_dir_name,
+                )
+            else:
+                await self._reset_docker_runtime()
 
-        # The harness intentionally does NOT pre-deploy any VSS profile
-        # here. Each eval spec's first `expects[]` query is responsible
-        # for invoking `/vss-deploy-profile` (or the appropriate
-        # standalone-deploy runbook) — making the deploy step visible
-        # in the trial's reward + trajectory rather than hidden in the
-        # env provider. The previous `_ensure_prerequisite_deployed`
-        # hook + `/tmp/skill-eval/active-deploy.txt` marker are gone.
+            # The harness intentionally does NOT pre-deploy any VSS profile
+            # here. Each eval spec's first `expects[]` query is responsible
+            # for invoking `/vss-deploy-profile` (or the appropriate
+            # standalone-deploy runbook) — making the deploy step visible
+            # in the trial's reward + trajectory rather than hidden in the
+            # env provider. The previous `_ensure_prerequisite_deployed`
+            # hook + `/tmp/skill-eval/active-deploy.txt` marker are gone.
 
         self._started = True
         logger.info("Brev instance %s is reachable", self._instance_name)
@@ -438,6 +451,52 @@ echo "docker runtime reset OK; images preserved ($(docker images -q | wc -l | tr
             self._instance_name,
             (result.stdout or "").strip().splitlines()[-1] if result.stdout else "<no output>",
         )
+
+    async def _ensure_nemoclaw_ready(self, meta: dict) -> None:
+        """Run the setup-only notebook subset and readiness probes.
+
+        This keeps the human notebook as the source of truth while making the
+        CI path headless.  The executed notebook and readiness report remain on
+        the Brev worker under /tmp/skill-eval/nemoclaw for artifact collection
+        and operator debugging.
+        """
+        required_tools = meta.get("required_mcp_tools") or []
+        if isinstance(required_tools, str):
+            required_tools = [required_tools]
+        required_tools_csv = ",".join(str(tool) for tool in required_tools)
+
+        cmd = rf"""set -euo pipefail
+source ~/.profile 2>/dev/null || true
+export PATH="$HOME/.local/bin:$HOME/.claude/bin:$PATH"
+REPO="$HOME/video-search-and-summarization"
+cd "$REPO"
+mkdir -p /tmp/skill-eval/nemoclaw
+python3 -m pip install --user --quiet nbformat nbclient ipykernel >/tmp/skill-eval/nemoclaw/pip-install.log 2>&1 || {{
+  cat /tmp/skill-eval/nemoclaw/pip-install.log >&2
+  exit 1
+}}
+python3 .github/skill-eval/nemoclaw/notebook_setup_adapter.py \
+  --execute \
+  --output /tmp/skill-eval/nemoclaw/deploy_nemoclaw_vss.executed.ipynb \
+  --env-out /tmp/skill-eval/nemoclaw/nemoclaw.env
+python3 .github/skill-eval/nemoclaw/readiness.py \
+  --env-file /tmp/skill-eval/nemoclaw/nemoclaw.env \
+  --required-tools {shlex.quote(required_tools_csv)} \
+  --output /tmp/skill-eval/nemoclaw/readiness.json
+"""
+        timeout_sec = int(os.environ.get("NEMOCLAW_SETUP_TIMEOUT_SEC", "5400"))
+        logger.info(
+            "Preparing NemoClaw/OpenClaw on %s (timeout=%ds)",
+            self._instance_name, timeout_sec,
+        )
+        result = await _run_brev_exec(self._instance_name, cmd, timeout=timeout_sec)
+        if result.return_code != 0:
+            tail = (result.stderr or result.stdout or "")[-1500:]
+            raise RuntimeError(
+                f"NemoClaw setup failed on {self._instance_name}: "
+                f"exit {result.return_code}; output tail:\n{tail}"
+            )
+        logger.info("NemoClaw/OpenClaw setup succeeded on %s", self._instance_name)
 
     async def _sync_repo_to_pr_head(self) -> None:
         """Reset `~/video-search-and-summarization` on the Brev box to the
@@ -1343,5 +1402,3 @@ async def _check_live_resources(instance_name: str, req: dict) -> None:
             "Instance '%s' driver: %s (>= required %s)",
             instance_name, actual, min_driver,
         )
-
-
