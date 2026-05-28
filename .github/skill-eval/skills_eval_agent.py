@@ -331,7 +331,7 @@ async def run_agent() -> int:
 
     if manual_sweep:
         user_prompt = f"""
-**Manual full-sweep run** — `workflow_dispatch` fired (no PR, no diff).
+**Manual full-sweep run** — `workflow_dispatch` or `schedule` or `push` fired (no PR, no diff).
 
 Context:
   repo                = {pr_repo}
