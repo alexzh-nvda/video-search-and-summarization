@@ -124,6 +124,17 @@ The canonical harbor command is in § Harbor invocation.
    pre-authorized to deploy autonomously (see the PREAMBLE that every
    adapter renders into the trial prompt).
 
+   **NemoClaw fail-fast contract.** When `SKILLS_EVAL_RUNNER=nemoclaw`
+   or a spec sets `runner: "nemoclaw"`, do not debug by hot-patching
+   the live Brev worker, OpenClaw container, OpenClaw image, notebook
+   output, `~/.eval_env`, or unrelated run artifacts. Run the canonical
+   Harbor command once for the selected scenario. If setup or Harbor
+   fails, read only this run's `trial.log`, `test-stdout.txt`,
+   `nemoclaw_hooks_response.json`, and readiness/setup artifacts, record
+   a concise `BLOCKED:` or failed-result summary, and exit. Fixes must
+   be made as code changes on the branch and evaluated by a new workflow
+   run, not by mutating the live worker from inside CI.
+
    Skills with no specs at all are runtime libraries — skip them.
 
 3. **For each evaluable skill × spec, ensure an adapter exists under
@@ -378,12 +389,16 @@ The canonical harbor command is in § Harbor invocation.
       resolved in step 5a; the canonical snippet has the line —
       omitting it makes `BrevEnvironment.start()` raise immediately
       ("no instance resolved, harness does not auto-provision") and
-      the trial fails before harbor invokes the agent. If a trial fails, read the
-      trial log, fix the adapter (not the flags), rerun. While a
-      trial is running, do NOT poll the remote box from your tool loop
-      — harbor has its own agent-execution timeout and will fail the
-      trial cleanly. Spend turns on the next trial's setup or on
-      reading already-completed trial logs instead.
+      the trial fails before harbor invokes the agent. If a trial fails on
+      the regular Claude Code path, read the trial log, fix the adapter
+      (not the flags), and rerun once. If a trial fails on the NemoClaw
+      path, do not retry or hot-patch the worker; emit the failed result
+      or `BLOCKED:` summary with the artifact path and exit. While a
+      trial is running, do NOT babysit the remote box (no
+      `brev exec` polling, no `Monitor` on remote logs); harbor has
+      its own agent-execution timeout and will fail the trial
+      cleanly. Spend turns on the next trial's setup or on reading
+      already-completed trial logs instead.
    d. After each trial, parse
       `$RES/<date>/<trial>/verifier/reward.txt`
       and `test-stdout.txt`. Record `(spec, platform, reward,
