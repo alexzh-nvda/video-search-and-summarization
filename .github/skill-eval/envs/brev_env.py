@@ -575,8 +575,23 @@ else
 fi
 # Drop leftover working-tree state from a prior trial, but keep data/
 # (sample-data extract — slow to re-pull from NGC) and any .env tweaks
-# the active trial may have placed.
-git clean -fdx -e data/ -e .env
+# the active trial may have placed. Some VSS services write root-owned
+# bind-mount content under the checkout, so remove known deployment
+# output dirs with sudo before falling back to git clean.
+for stale_path in "$REPO/deployments" "$REPO/deploy/docker/data-dir"; do
+  if [ -e "$stale_path" ]; then
+    sudo rm -rf "$stale_path" || true
+  fi
+done
+if ! git clean -fdx -e data/ -e .env; then
+  echo "git clean failed; repairing checkout ownership and retrying" >&2
+  sudo find "$REPO" \
+    -path "$REPO/.git" -prune -o \
+    -path "$REPO/data" -prune -o \
+    -path "$REPO/.env" -prune -o \
+    -exec chown -h "$(id -u):$(id -g)" {{}} + || true
+  git clean -fdx -e data/ -e .env
+fi
 echo "synced $REPO to $(git rev-parse --short HEAD)"
 """
         logger.info("Syncing $REPO on %s to PR_HEAD_SHA", self._instance_name)
