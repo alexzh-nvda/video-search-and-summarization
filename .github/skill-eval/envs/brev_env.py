@@ -1181,7 +1181,7 @@ async def _get_instance_gpu_count_from_catalog(instance_type: str) -> int | None
 
 
 async def _check_live_gpu_count(instance_name: str, required_count: int) -> None:
-    """SSH in and count GPUs via nvidia-smi. Raises on mismatch."""
+    """SSH in and count GPUs via nvidia-smi. Raises when capacity is too small."""
     result = await _run_brev_exec(
         instance_name,
         "nvidia-smi --query-gpu=name --format=csv,noheader | wc -l",
@@ -1202,16 +1202,14 @@ async def _check_live_gpu_count(instance_name: str, required_count: int) -> None
             instance_name, result.stdout,
         )
         return
-    if actual != required_count:
+    if actual < required_count:
         raise RuntimeError(
             f"Brev instance '{instance_name}' has {actual} GPU(s) (live "
-            f"nvidia-smi); task requires exactly {required_count}. Pool "
-            f"partition mismatch — pick a fleet member with the matching "
-            f"GPU count (e.g. vss-eval-l40s-1g for 1-GPU, vss-eval-l40s* "
-            f"for 2-GPU)."
+            f"nvidia-smi); task requires at least {required_count}. Pick a "
+            f"fleet member with enough GPUs."
         )
     logger.info(
-        "Instance '%s' live gpu_count: %d (matches required %d)",
+        "Instance '%s' live gpu_count: %d (meets required >= %d)",
         instance_name, actual, required_count,
     )
 
@@ -1305,9 +1303,9 @@ async def _check_instance_matches(instance: dict, req: dict) -> None:
                 await _check_live_gpu_count(instance.get("name"), required_count)
             except RuntimeError as exc:
                 errors.append(str(exc))
-        elif catalog_count != required_count:
+        elif catalog_count < required_count:
             errors.append(
-                f"gpu_count: want exactly {required_count}, instance has "
+                f"gpu_count: want at least {required_count}, instance has "
                 f"{catalog_count} (instance_type={instance.get('instance_type')})"
             )
 
@@ -1324,7 +1322,7 @@ async def _check_instance_matches(instance: dict, req: dict) -> None:
         require_clauses = []
         if required_type:
             require_clauses.append(f"gpu_type={required_type!r}")
-        require_clauses.append(f"gpu_count={required_count}")
+        require_clauses.append(f"gpu_count>={required_count}")
         require_phrase = " + ".join(require_clauses)
         hint = (
             f"\n\nTo find a matching pool member, scan vss-eval-* "
