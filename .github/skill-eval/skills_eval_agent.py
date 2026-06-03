@@ -311,7 +311,7 @@ async def run_agent() -> int:
         skills_filter = os.environ.get("MANUAL_SKILLS_FILTER", "*").strip().splitlines()[0] if os.environ.get("MANUAL_SKILLS_FILTER", "").strip() else "*"
         step_summary = os.environ.get("GITHUB_STEP_SUMMARY", "")
     elif daily_run:
-        pr_number = os.environ.get("PR_NUMBER", "") or f"manual-{run_id}"
+        pr_number = os.environ.get("PR_NUMBER", "") or f"daily-run-{run_id}"
         pr_base = os.environ.get("PR_BASE", "") or "(daily-run)"
         eval_kind = os.environ.get("EVAL_KIND", "eval")
         eval_skill = _require("EVAL_SKILL")
