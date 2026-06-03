@@ -2,23 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Harbor environment provider for Brev GPU instances.
 
-Two modes:
-
-1. **Reuse an existing instance** (BREV_INSTANCE env var):
-   Validate the instance's GPU meets the task's requirements
-   (gpu_type, gpu_count, min_vram_gb_per_gpu from task.toml [metadata])
-   and fail early if not.
-
-2. **Auto-provision** (no BREV_INSTANCE):
-   Query `brev search --json` for a matching instance type, create
-   one, wait for ready.  The instance is stopped (not deleted) on
-   trial completion so subsequent trials can reuse it.
+Connects to a pre-existing operator-managed `vss-eval-*` pool member
+resolved via the `BREV_INSTANCE` env var (or `brev_instance` in
+task.toml [metadata]). Validates that the resolved instance is
+reachable and that its GPU meets the task's requirements; raises if
+no instance is resolved. The harness does NOT auto-provision — see
+AGENTS.md § 5a for the fleet-selection algorithm the skill-eval
+agent uses to pick a pool member.
 
 Task.toml [metadata] fields consumed:
     gpu_type              — e.g. "L40S", "H100", "RTX PRO 6000"
     gpu_count             — 1 or 2
     min_vram_gb_per_gpu   — e.g. 48, 80
-    brev_search           — (optional) substring override for brev search
+    min_root_disk_gb      — root-disk floor enforced post-resolve
+    min_gpu_driver_version — driver floor enforced post-resolve
     brev_instance         — (optional) explicit instance name override
 """
 
@@ -29,6 +26,9 @@ import json
 import logging
 import os
 import shlex
+import signal
+import subprocess
+import tempfile
 import uuid
 from enum import Enum
 from pathlib import Path
@@ -47,22 +47,11 @@ BREV_EXEC_TIMEOUT = int(os.environ.get("BREV_EXEC_TIMEOUT", "1800"))
 # Timeout for brev copy commands.
 BREV_COPY_TIMEOUT = int(os.environ.get("BREV_COPY_TIMEOUT", "300"))
 
-
-def _record_started_instance(name: str) -> None:
-    """Append an auto-provisioned instance name to the wrapper's
-    cleanup marker (`/tmp/brev/started-by-<run_id>.txt`) so
-    skills_eval_agent.cleanup_instances() tears it down even if the
-    agent never observes the name. No-op outside CI (no GITHUB_RUN_ID)."""
-    run_id = os.environ.get("GITHUB_RUN_ID")
-    if not run_id:
-        return
-    try:
-        marker = Path(f"/tmp/brev/started-by-{run_id}.txt")
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        with marker.open("a") as fh:
-            fh.write(f"{name}\n")
-    except OSError as exc:
-        logger.warning("failed to record %s in started-by marker: %s", name, exc)
+# Artifact-collection (download_*) resilience. A stalled transfer that is
+# killed can orphan its ssh child and wedge the box for the next step;
+# retrying a transient stall on a fresh connection recovers it. Tunable.
+BREV_DOWNLOAD_RETRIES = int(os.environ.get("BREV_DOWNLOAD_RETRIES", "3"))
+BREV_DOWNLOAD_BACKOFF_SEC = float(os.environ.get("BREV_DOWNLOAD_BACKOFF_SEC", "5"))
 
 
 class BrevEnvironmentType(str, Enum):
@@ -120,7 +109,7 @@ class BrevEnvironment(BaseEnvironment):
         return tomllib.loads(task_toml.read_text()).get("metadata", {}) or {}
 
     def _resolve_instance_name(self) -> str | None:
-        """Resolve instance name: env var > task.toml > None (auto-provision)."""
+        """Resolve instance name: env var > task.toml > None (error)."""
         if DEFAULT_INSTANCE:
             return DEFAULT_INSTANCE
         meta = self._read_task_metadata()
@@ -129,7 +118,9 @@ class BrevEnvironment(BaseEnvironment):
         return None
 
     async def start(self, force_build: bool) -> None:
-        """Validate or provision a Brev instance matching task GPU requirements."""
+        """Validate that the resolved Brev instance is reachable and matches
+        the task's GPU requirements. Errors if no instance is resolved —
+        the harness does not auto-provision."""
         if self._started:
             return
 
@@ -138,7 +129,6 @@ class BrevEnvironment(BaseEnvironment):
             "gpu_type": meta.get("gpu_type"),
             "gpu_count": int(meta.get("gpu_count", 1)),
             "min_vram_gb_per_gpu": int(meta.get("min_vram_gb_per_gpu", 0)),
-            "brev_search": meta.get("brev_search") or meta.get("gpu_type"),
             "min_root_disk_gb": int(meta.get("min_root_disk_gb", 0)),
             "min_gpu_driver_version": meta.get("min_gpu_driver_version"),
         }
@@ -157,61 +147,15 @@ class BrevEnvironment(BaseEnvironment):
                 )
             await _check_instance_matches(instance, requirements)
         else:
-            # Mode 2: auto-provision via brev search + create.
-            # Some platforms (DGX-SPARK, IGX-THOR) aren't provisionable as
-            # cloud instance types — they're physical devices registered via
-            # `brev register`.  Check there first and give a helpful error.
-            if not requirements["brev_search"]:
-                raise RuntimeError(
-                    "No BREV_INSTANCE set and no GPU requirements in task.toml "
-                    "[metadata] — cannot auto-provision."
-                )
-            logger.info("Auto-provisioning Brev instance for %s", requirements)
-            instance_type = await _find_cheapest_matching_type(requirements)
-            if not instance_type:
-                # Before failing, list any registered nodes that might fit.
-                suggestions = await _suggest_registered_devices(requirements)
-                msg = [
-                    f"Cannot auto-provision: no Brev cloud instance type matches",
-                    f"  requirements: {requirements}",
-                ]
-                if suggestions:
-                    msg.append("")
-                    msg.append("Registered device(s) matching (or partially matching) these requirements:")
-                    for s in suggestions:
-                        msg.append(f"  - {s}")
-                    msg.append("")
-                    msg.append(
-                        "Set `BREV_INSTANCE=<name>` or add `brev_instance = \"<name>\"` "
-                        "to task.toml [metadata] to use one of these."
-                    )
-                else:
-                    msg.append("")
-                    msg.append(
-                        "No registered devices match either. Options:\n"
-                        "  1. Register a physical device via `brev register` "
-                        "(DGX Spark / IGX Thor are typically registered, not provisioned).\n"
-                        "  2. Adjust gpu_type / brev_search in the task to a provisionable "
-                        "platform (e.g. H100, L40S, RTX PRO 6000)."
-                    )
-                full_msg = "\n".join(msg)
-                logger.error(full_msg)
-                raise RuntimeError(full_msg)
-            self._instance_name = f"harbor-{uuid.uuid4().hex[:8]}"
-            logger.info("Creating %s as %s", self._instance_name, instance_type)
-            create_result = await _run_brev(
-                "create", self._instance_name, "--detached",
-                stdin_data=instance_type,
-                timeout=120,
+            raise RuntimeError(
+                "No BREV_INSTANCE set and no `brev_instance` in task.toml "
+                "[metadata]. The harness no longer auto-provisions — every "
+                "trial must run on an operator-managed `vss-eval-*` pool "
+                "member. The skill-eval agent picks one per AGENTS.md § 5a "
+                "and exports BREV_INSTANCE before invoking `uvx harbor run`. "
+                "If you're running harbor manually, export "
+                "BREV_INSTANCE=<vss-eval-*-name> first."
             )
-            if create_result.return_code != 0:
-                raise RuntimeError(f"brev create failed: {create_result.stderr}")
-            # Record the harbor-* instance in the wrapper's cleanup marker
-            # so skills_eval_agent.cleanup_instances() tears it down even if
-            # the trial fails before the agent tracks it. Append before
-            # _wait_for_running so a timeout there doesn't leak an orphan.
-            _record_started_instance(self._instance_name)
-            await _wait_for_running(self._instance_name)
 
         # Quick smoke test — ensure exec works
         result = await _run_brev_exec(
@@ -229,21 +173,41 @@ class BrevEnvironment(BaseEnvironment):
                 f"{(result.stdout or '')[:200]!r}"
             )
 
-        # Post-provision resource checks: root disk + GPU driver.
-        # These catch provider quirks that brev search doesn't surface
-        # (e.g. hyperstack_H100x2 lists disk_min_gb=1600 but mounts the
-        # big volume on /ephemeral — / is only ~100 GB, which OOMs on
-        # local NIM pulls).
+        # Live resource checks: root disk + GPU driver. The pool box was
+        # provisioned by the operator and is expected to meet these, but
+        # the checks catch silent regressions (e.g. a driver downgrade or
+        # a box where the big volume mounts on /ephemeral and / is only
+        # ~100 GB — which OOMs on local NIM pulls).
         await _check_live_resources(self._instance_name, requirements)
 
         # Pre-create harbor's expected directories with correct ownership
         # so that agent and verifier processes can write to them.
-        await _run_brev_exec(
+        #
+        # Wipe /logs/artifacts and /logs/verifier FIRST: harbor's
+        # Trial._download_artifacts() does a blanket download_dir(/logs/artifacts)
+        # and nothing on a warm-pool box ever clears that dir, so a prior
+        # trial's arbitrarily-named files get collected as THIS trial's
+        # artifacts (observed: 3-day-old `nemoclaw/` base-deploy logs surfacing
+        # in an unrelated profile_in_1 trial's artifact tarball). /logs/agent is
+        # left intact here — its prior-trial session JSONLs are handled by the
+        # archive step just below (move-not-delete, for forensic SSH access).
+        setup_dirs_result = await _run_brev_exec(
             self._instance_name,
+            "sudo rm -rf /logs/artifacts /logs/verifier && "
             "sudo mkdir -p /logs/agent /logs/verifier /logs/artifacts /tests /solution /skills && "
             "sudo chown -R $(whoami):$(id -gn) /logs /tests /solution /skills",
             timeout=30,
         )
+        # Fail loud: this is the load-bearing artifacts wipe. A silent failure
+        # would leave the prior trial's /logs/artifacts in place and re-collect
+        # it as this trial's output — the exact contamination being fixed —
+        # so it gets the same exit-code guard as the docker reset / repo sync.
+        if setup_dirs_result.return_code != 0:
+            tail = (setup_dirs_result.stderr or setup_dirs_result.stdout or "")[-500:]
+            raise RuntimeError(
+                f"log-dir reset/setup failed on {self._instance_name}: "
+                f"exit {setup_dirs_result.return_code}; tail:\n{tail}"
+            )
 
         # Archive any session JSONLs left by prior trials on this warm-pool
         # box. Without this, harbor's claude-code mapper merges every
@@ -308,6 +272,12 @@ class BrevEnvironment(BaseEnvironment):
             # the renamed release/3.2.0 container names while the eval
             # deployed feat/skills's old names).
             "PR_HEAD_SHA", "PR_REPO",
+            # Identifies this CI run inside the trial environment for
+            # logs and any future per-run scratch dirs the agent may
+            # create. No longer load-bearing now that the harness
+            # doesn't pre-deploy profiles or maintain an active-deploy
+            # marker.
+            "GITHUB_RUN_ID",
         ):
             val = os.environ.get(key)
             if val:
@@ -350,189 +320,123 @@ class BrevEnvironment(BaseEnvironment):
         # PR_HEAD_SHA forwarded above never actually lands on disk.
         await self._sync_repo_to_pr_head()
 
-        # Pre-deploy any prerequisite profile declared in task.toml [metadata].
-        # Idempotent via marker file on the box, so dependent trials reuse the
-        # deployment without re-running it.
-        await self._ensure_prerequisite_deployed(meta)
+        # Wipe the warm-pool box's docker runtime to a clean slate so no
+        # prior trial's deployment state can contaminate this one. Images are
+        # preserved (re-pulling the image set is slow); all containers,
+        # user-defined networks, and volumes are removed. See
+        # _reset_docker_runtime for why this is blanket, not VSS-scoped.
+        #
+        # Gate: ONLY on a spec's first trial — a single-step spec (task dir is
+        # the platform, e.g. `rtxpro6000bw`) or `step-1` of a multi-step spec.
+        # Multi-step checks for step N assume the deployment state established
+        # by step N-1 (AGENTS.md § "Multi-step specs"), and each step is a
+        # separate `harbor run` → separate start(); resetting before step-2+
+        # would destroy the very state under test. step-1 gets the clean box;
+        # later steps build on it. (`environment_dir.parent` is the task dir —
+        # named `step-N` for multi-step, the platform for single-step.)
+        # Caveat: a manual `harbor run` targeting only `step-2+` in isolation
+        # skips the reset and inherits whatever is on the box — run `step-1`
+        # first, or reset by hand. Normal CI always runs `step-1` first on a
+        # freshly reset box, so the gate is correct there.
+        task_dir_name = self.environment_dir.parent.name
+        if task_dir_name.startswith("step-") and task_dir_name != "step-1":
+            logger.info(
+                "Skipping docker runtime reset on %s — %s of a multi-step spec "
+                "must preserve step-1's deployment state",
+                self._instance_name, task_dir_name,
+            )
+        else:
+            await self._reset_docker_runtime()
+
+        # The harness intentionally does NOT pre-deploy any VSS profile
+        # here. Each eval spec's first `expects[]` query is responsible
+        # for invoking `/vss-deploy-profile` (or the appropriate
+        # standalone-deploy runbook) — making the deploy step visible
+        # in the trial's reward + trajectory rather than hidden in the
+        # env provider. The previous `_ensure_prerequisite_deployed`
+        # hook + `/tmp/skill-eval/active-deploy.txt` marker are gone.
 
         self._started = True
         logger.info("Brev instance %s is reachable", self._instance_name)
 
-    async def _ensure_prerequisite_deployed(self, meta: dict) -> None:
-        """Reconcile the Brev box's deployment state with what this
-        trial's task.toml [metadata] declares. Reads a single canonical
-        marker that records what is currently RUNNING on the box — not
-        a deploy log. See specs/stale-marker.spec.
+    async def _reset_docker_runtime(self) -> None:
+        """Wipe the warm-pool box's docker runtime before the trial.
 
-        Three regimes, derived from `profile` + `prerequisite_deploy_mode`:
+        Removes **all** containers (running + stopped), **all** volumes
+        (named + anonymous), and **all** user-defined networks, while
+        **preserving images** — re-pulling the multi-GB VSS/NIM image set on
+        every trial would dominate wall-clock.
 
-        1. `profile` set (downstream needs a deployed VSS stack):
-            desired = `<profile>` (e.g. `base`, `lvs`, `search`),
-                  or `<profile>-<deploy_mode>` for alerts variants
-                  (`alerts-verification`, `alerts-real-time`).
-            If marker == desired → hot, no-op.
-            Else → run `/vss-deploy-profile -p <profile> [-m <mode>]` via
-                  `claude --print`. On success OVERWRITE marker.
+        Why blanket, not VSS-project-scoped: trials reach a deploy through
+        heterogeneous paths — direct `docker compose --profile …`, the
+        `/vss-deploy-profile` runbook, an MCP-orchestrator base deploy — under
+        different compose project names. A project- or label-scoped
+        `compose down` from the incoming trial therefore cannot reach a
+        *predecessor's* stack, so a leftover container port-conflicts the new
+        deploy (observed: a profile_in_1 trial where `phoenix` was stuck
+        `Created` and several init containers were missing because a prior
+        base-profile deploy's containers still held the ports). Removing
+        everything is the only reset that doesn't depend on knowing what the
+        last trial deployed. Safe because `vss-eval-*` boxes are a dedicated,
+        flock-serialised eval pool — nothing else runs on them.
 
-        2. `profile` absent (trial needs a clean box, no VSS running):
-            desired = `""` (empty marker).
-            Always tear down all containers (`docker rm -f $(docker
-                  ps -aq)`) + prune networks; OVERWRITE marker to empty.
-                  An empty marker does not prove a prior standalone
-                  profile-less trial cleaned up every container it started.
-                  Preserves anything `docker rm -f` doesn't touch:
-                  docker image cache, named volumes (postgres / ES /
-                  kafka data), repo clone, and sample-data extract —
-                  the slow caches that make warm reuse valuable for
-                  the next deploy trial. Cleanup failures fail loud:
-                  if either docker command exits non-zero the marker
-                  is NOT overwritten, so the next trial re-attempts
-                  the reconcile instead of running against a
-                  partially-dirty box that pretends to be clean.
+        NOTE: wiping all volumes also drops the model-weight caches
+        (`rtvi-hf-cache`, `rtvi-ngc-model-cache`), so the next deploy pays the
+        full cold model-weight download (~20 min vs ~55 s warm). The caller
+        gates this to a spec's first trial only (single-step, or step-1 of a
+        multi-step spec — later steps reuse step-1's deployment), so under the
+        canonical `-n 1 --max-retries 0` invocation (one trial per spec) the
+        cost is paid once per spec, not once per step. An `-n>1` rollout, a
+        harbor retry, or a repeated manual run on the same warm box each
+        re-wipes the caches and re-pays the cold start. The per-trial harbor
+        timeout already budgets for a cold deploy.
 
-        vss-deploy-profile/* trials don't set `profile` in their task.toml
-        [metadata], so they fall into the `desired=""` box-clean branch
-        above — wipes containers/networks/volumes and clears the marker
-        before the trial deploys from scratch. Their test.sh writes the
-        marker on reward=1.0 for downstream warm-reuse. (Earlier the
-        adapter emitted `profile = "<X>"` here, which mistakenly fired
-        the prereq reconcile below before the trial — see commit
-        history on `adapters/vss-deploy-profile/generate.py`.)
-
-        claude-code is expected on the box from a prior vss-deploy-profile/* trial's
-        harbor agent setup; persists across trials on the reused
-        vss-eval-* instance. Override the wall clock via
-        PRE_DEPLOY_TIMEOUT_SEC (default 1800s)."""
-        profile = meta.get("profile")
-        deploy_mode = meta.get("prerequisite_deploy_mode")
-        if profile and deploy_mode:
-            desired = f"{profile}-{deploy_mode}"
-        elif profile:
-            desired = profile
-        else:
-            desired = ""
-
-        marker_path = "/tmp/skill-eval/active-deploy.txt"
-        probe = await _run_brev_exec(
+        Runs as the normal (docker-group) user — the same identity the
+        trial's deploy uses; no sudo. `network prune` leaves the built-in
+        bridge/host/none networks, which is correct. Fails loud (`set -u`,
+        explicit `exit 1`) if the daemon is unreachable or dies mid-reset, or
+        if any container, volume, or user-defined network survives, so a
+        half-reset box surfaces as a trial error rather than silent cross-trial
+        contamination.
+        """
+        cmd = r"""set -uo pipefail
+docker info >/dev/null 2>&1 || { echo "docker daemon unreachable" >&2; exit 1; }
+cids=$(docker ps -aq); [ -n "$cids" ] && docker rm -f $cids >/dev/null 2>&1 || true
+vols=$(docker volume ls -q); [ -n "$vols" ] && docker volume rm -f $vols >/dev/null 2>&1 || true
+docker network prune -f >/dev/null 2>&1 || true
+# Re-confirm the daemon survived the reset. Without `set -e`, a daemon that
+# died mid-script would make the count commands below print nothing and the
+# guard read 0/0/0 -- faking a clean reset. The counts run microseconds after
+# this check, so the remaining TOCTOU window is negligible.
+docker info >/dev/null 2>&1 || { echo "docker daemon died during reset" >&2; exit 1; }
+rc=$(docker ps -aq | wc -l | tr -d ' ')
+rv=$(docker volume ls -q | wc -l | tr -d ' ')
+# Only user-defined networks should be gone; the built-in bridge/host/none
+# are never removable, so filter to type=custom. A surviving user network
+# would collide ("network already exists" / address-range clash) on the next
+# `compose up`, so it must fail the reset like a surviving container/volume.
+rn=$(docker network ls --filter type=custom -q | wc -l | tr -d ' ')
+if [ "$rc" != "0" ] || [ "$rv" != "0" ] || [ "$rn" != "0" ]; then
+  echo "docker runtime reset incomplete: ${rc} containers, ${rv} volumes, ${rn} user-defined networks remain" >&2
+  exit 1
+fi
+echo "docker runtime reset OK; images preserved ($(docker images -q | wc -l | tr -d ' ') layers)"
+"""
+        logger.info(
+            "Resetting docker runtime (all containers/networks/volumes; images kept) on %s",
             self._instance_name,
-            f"cat {shlex.quote(marker_path)} 2>/dev/null || true",
-            timeout=30,
         )
-        current = (probe.stdout or "").strip()
-        if current == desired and desired:
-            state = desired or "<clean>"
-            logger.info(
-                "prerequisite %s already current on %s; skipping reconcile",
-                state, self._instance_name,
-            )
-            return
-        logger.info(
-            "prerequisite mismatch on %s (active=%r, desired=%r); reconciling",
-            self._instance_name, current or "<empty>", desired or "<clean>",
-        )
-
-        if not desired:
-            # Profile-less trial wants a clean box. Tear down all
-            # containers, networks, AND volumes so the deploy starts
-            # against a guaranteed-empty state — postgres / ES / kafka /
-            # agent-eval volumes from a prior profile's run would
-            # otherwise be reused and could leak schema or stale rows
-            # into the next deploy. Keeps the docker image cache, repo
-            # clone, and sample-data extract (~/data) warm; those are
-            # profile-agnostic and slow to re-pull from NGC.
-            #
-            # `docker volume prune -af` removes all unused volumes
-            # (including named ones like `agent-eval`); becomes safe to
-            # run only after `docker rm -f` releases the references.
-            # For volumes whose `driver_opts` bind a host path (e.g.
-            # `agent-eval` → `$VSS_DATA_DIR/agent_eval`), prune
-            # unregisters the docker volume but does NOT wipe the bind
-            # directory contents — that's an operator-managed dir and
-            # the next deploy re-binds to it.
-            #
-            # No `|| true` on the docker commands by design — if any
-            # step exits non-zero (stuck container, daemon transient
-            # error) the `&&` chain short-circuits and the marker is
-            # left as it was, so the next trial re-runs the reconcile
-            # rather than silently treating a partially-dirty box as
-            # clean. `xargs -r` already handles the "no containers to
-            # remove" case (skips invoking docker rm at all, exit 0).
-            cmd = (
-                "mkdir -p /tmp/skill-eval && "
-                "docker ps -aq | xargs -r docker rm -f >/dev/null && "
-                "docker network prune -f >/dev/null && "
-                "docker volume prune -af >/dev/null && "
-                f"printf '' > {shlex.quote(marker_path)}"
-            )
-            logger.info(
-                "Cleaning box %s (no profile required)", self._instance_name,
-            )
-            result = await _run_brev_exec(self._instance_name, cmd, timeout=120)
-            if result.return_code != 0:
-                tail = (result.stderr or result.stdout or "")[-500:]
-                raise RuntimeError(
-                    f"box-clean failed on {self._instance_name}: "
-                    f"exit {result.return_code}; tail:\n{tail}"
-                )
-            return
-
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
-        model = (
-            os.environ.get("ANTHROPIC_MODEL")
-            or "claude-sonnet-4-6"
-        )
-        if not api_key:
-            raise RuntimeError(
-                "ANTHROPIC_API_KEY must be set on the coordinator to "
-                "pre-deploy a prerequisite profile via claude --print."
-            )
-
-        env_prefix_parts = [
-            f"ANTHROPIC_API_KEY={shlex.quote(api_key)}",
-            f"ANTHROPIC_MODEL={shlex.quote(model)}",
-            "CLAUDE_CODE_DISABLE_THINKING=1",
-        ]
-        if base_url:
-            env_prefix_parts.append(f"ANTHROPIC_BASE_URL={shlex.quote(base_url)}")
-        env_prefix = " ".join(env_prefix_parts)
-
-        prompt = f"/vss-deploy-profile -p {profile}"
-        if deploy_mode:
-            prompt += f" -m {deploy_mode}"
-        # Overwrite (>) the canonical marker on /vss-deploy-profile success — the
-        # marker reflects what is currently running, not a deploy log.
-        # PATH prepend: brev exec runs a non-interactive shell that does
-        # not source ~/.bashrc, where harbor writes
-        # `export PATH="$HOME/.local/bin:$PATH"`. claude-code installs
-        # to ~/.local/bin via its curl installer, so a bare `claude`
-        # invocation here resolves "command not found" without this.
-        cmd = (
-            f'export PATH="$HOME/.local/bin:$PATH" && '
-            f"mkdir -p /tmp/skill-eval && "
-            f"{env_prefix} claude --print --dangerously-skip-permissions "
-            f"{shlex.quote(prompt)} "
-            f"&& printf '%s\\n' {shlex.quote(desired)} > {shlex.quote(marker_path)}"
-        )
-
-        timeout_sec = int(os.environ.get("PRE_DEPLOY_TIMEOUT_SEC", "1800"))
-        logger.info(
-            "Pre-deploying %s on %s (timeout=%ds)",
-            desired, self._instance_name, timeout_sec,
-        )
-        result = await _run_brev_exec(
-            self._instance_name, cmd, timeout=timeout_sec,
-        )
+        result = await _run_brev_exec(self._instance_name, cmd, timeout=300)
         if result.return_code != 0:
             tail = (result.stderr or result.stdout or "")[-500:]
             raise RuntimeError(
-                f"pre-deploy /vss-deploy-profile -p {profile} -m {deploy_mode} failed "
-                f"on {self._instance_name}: exit {result.return_code}; "
-                f"output tail: {tail!r}"
+                f"docker runtime reset failed on {self._instance_name}: "
+                f"exit {result.return_code}; tail:\n{tail}"
             )
         logger.info(
-            "Pre-deploy %s succeeded on %s; active marker overwritten",
-            desired, self._instance_name,
+            "Docker reset on %s: %s",
+            self._instance_name,
+            (result.stdout or "").strip().splitlines()[-1] if result.stdout else "<no output>",
         )
 
     async def _sync_repo_to_pr_head(self) -> None:
@@ -635,35 +539,103 @@ echo "synced $REPO to $(git rev-parse --short HEAD)"
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
         assert self._instance_name
-        # brev copy has broken directory nesting behaviour.  Use tar
-        # piped over brev exec: tar locally, base64-encode, send via
-        # exec, decode+untar on the remote side.
+        # brev copy has broken directory nesting behaviour. Package the
+        # directory locally, copy one archive, then extract remotely. Do
+        # not embed the archive bytes in a brev exec argv: larger skill
+        # bundles can exceed the OS per-argument limit.
         src = str(source_dir).rstrip("/")
-        import subprocess as _sp, base64 as _b64
-        tar_bytes = _sp.check_output(
-            ["tar", "-czf", "-", "-C", src, "."],
-            timeout=60,
+        fd, tar_path_str = tempfile.mkstemp(
+            prefix="brev-upload-", suffix=".tar.gz",
         )
-        encoded = _b64.b64encode(tar_bytes).decode()
-        result = await _run_brev_exec(
-            self._instance_name,
-            f"sudo mkdir -p {shlex.quote(target_dir)} && "
-            f"sudo chown $(whoami):$(id -gn) {shlex.quote(target_dir)} && "
-            f"echo '{encoded}' | base64 -d | tar -xzf - -C {shlex.quote(target_dir)}",
-            timeout=120,
-        )
-        if result.return_code != 0:
-            raise RuntimeError(f"Upload dir failed: {result.stderr}")
+        os.close(fd)
+        tar_path = Path(tar_path_str)
+        remote_upload_dir = f"/tmp/skill-eval/uploads/{uuid.uuid4().hex}"
+        remote_tar = f"{remote_upload_dir}/archive.tar.gz"
+
+        try:
+            subprocess.check_call(
+                ["tar", "-czf", str(tar_path), "-C", src, "."],
+                timeout=60,
+            )
+
+            result = await _run_brev_exec(
+                self._instance_name,
+                f"mkdir -p {shlex.quote(remote_upload_dir)}",
+                timeout=30,
+            )
+            if result.return_code != 0:
+                raise RuntimeError(f"Upload dir failed: {result.stderr}")
+
+            result = await _run_brev_copy(
+                str(tar_path), f"{self._instance_name}:{remote_tar}",
+            )
+            if result.return_code != 0:
+                raise RuntimeError(f"Upload dir failed: {result.stderr}")
+
+            target = shlex.quote(target_dir)
+            remote_archive = shlex.quote(remote_tar)
+            remote_dir = shlex.quote(remote_upload_dir)
+            result = await _run_brev_exec(
+                self._instance_name,
+                f"sudo mkdir -p {target} && "
+                f"sudo chown $(whoami):$(id -gn) {target}; "
+                "status=$?; "
+                "if [ $status -eq 0 ]; then "
+                f"tar -xzf {remote_archive} -C {target}; "
+                "status=$?; "
+                "fi; "
+                f"rm -f {remote_archive}; "
+                f"rmdir {remote_dir} 2>/dev/null || true; "
+                "exit $status",
+                timeout=120,
+            )
+            if result.return_code != 0:
+                raise RuntimeError(f"Upload dir failed: {result.stderr}")
+        finally:
+            tar_path.unlink(missing_ok=True)
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
         assert self._instance_name
-        result = await _run_brev_copy(
-            f"{self._instance_name}:{source_path}", str(target_path),
+        last_err = ""
+        for attempt in range(BREV_DOWNLOAD_RETRIES):
+            result = await _run_brev_copy(
+                f"{self._instance_name}:{source_path}", str(target_path),
+            )
+            if result.return_code == 0:
+                return
+            last_err = result.stderr or ""
+            if attempt + 1 < BREV_DOWNLOAD_RETRIES:
+                logger.warning(
+                    "download_file attempt %d/%d failed (%s) — retrying",
+                    attempt + 1, BREV_DOWNLOAD_RETRIES, last_err,
+                )
+                await asyncio.sleep(BREV_DOWNLOAD_BACKOFF_SEC * (attempt + 1))
+        raise RuntimeError(
+            f"Download failed after {BREV_DOWNLOAD_RETRIES} attempts: {last_err}"
         )
-        if result.return_code != 0:
-            raise RuntimeError(f"Download failed: {result.stderr}")
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
+        # Retry the pull: a transient stall — or a prior attempt whose ssh
+        # child was killed (now reaped via _run_brev_exec's process-group
+        # kill, so it can't wedge the box) — usually clears on a fresh
+        # connection. Raise loud only after exhausting retries.
+        last: Exception | None = None
+        for attempt in range(BREV_DOWNLOAD_RETRIES):
+            try:
+                await self._download_dir_once(source_dir, target_dir)
+                return
+            except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                last = exc
+                if attempt + 1 < BREV_DOWNLOAD_RETRIES:
+                    logger.warning(
+                        "download_dir attempt %d/%d failed (%s) — retrying",
+                        attempt + 1, BREV_DOWNLOAD_RETRIES, exc,
+                    )
+                    await asyncio.sleep(BREV_DOWNLOAD_BACKOFF_SEC * (attempt + 1))
+        assert last is not None
+        raise last
+
+    async def _download_dir_once(self, source_dir: str, target_dir: Path | str) -> None:
         assert self._instance_name
         # brev copy has broken directory nesting.  Use tar piped over
         # brev exec: tar on remote, base64-encode with markers, capture
@@ -761,6 +733,28 @@ def _which(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _kill_proc_group(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL the child's whole process group.
+
+    `proc.kill()` signals only the immediate child (the `brev`/`ssh`/`scp`
+    CLI). On a stalled transfer that leaves the underlying ssh data channel
+    orphaned — holding the secure-link/session open and wedging the box for
+    the next step (a killed large artifact pull can otherwise leave the
+    following trial's ports unreachable). Killing
+    the whole group reaps the orphan. Requires the child to have been
+    started with `start_new_session=True` so it leads its own group; falls
+    back to a plain kill if the group lookup fails."""
+    if proc.returncode is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
 # Registered external nodes (BYOH / DGX-Spark / IGX-Thor) can't use
 # `brev exec` — they require a direct SSH session via the alias that
 # `brev shell` writes into ~/.brev/ssh_config.  We cache the list on
@@ -821,6 +815,7 @@ async def _run_ssh_exec(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         stdout, stderr = await asyncio.wait_for(
@@ -828,7 +823,7 @@ async def _run_ssh_exec(
             timeout=timeout,
         )
     except asyncio.TimeoutError:
-        proc.kill()
+        _kill_proc_group(proc)
         stdout, stderr = await proc.communicate()
         return ExecResult(
             stdout=stdout.decode() if stdout else None,
@@ -863,6 +858,7 @@ async def _run_scp(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         stdout, stderr = await asyncio.wait_for(
@@ -870,7 +866,7 @@ async def _run_scp(
             timeout=timeout,
         )
     except asyncio.TimeoutError:
-        proc.kill()
+        _kill_proc_group(proc)
         stdout, stderr = await proc.communicate()
         return ExecResult(
             stdout=stdout.decode() if stdout else None,
@@ -909,6 +905,7 @@ async def _run_brev_exec(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
 
     try:
@@ -917,7 +914,7 @@ async def _run_brev_exec(
             timeout=timeout,
         )
     except asyncio.TimeoutError:
-        proc.kill()
+        _kill_proc_group(proc)
         stdout, stderr = await proc.communicate()
         return ExecResult(
             stdout=stdout.decode() if stdout else None,
@@ -961,6 +958,7 @@ async def _run_brev_copy(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
 
     try:
@@ -969,7 +967,7 @@ async def _run_brev_copy(
             timeout=timeout,
         )
     except asyncio.TimeoutError:
-        proc.kill()
+        _kill_proc_group(proc)
         stdout, stderr = await proc.communicate()
         return ExecResult(
             stdout=stdout.decode() if stdout else None,
@@ -998,6 +996,7 @@ async def _run_brev(*args: str, timeout: int = 30, stdin_data: str | None = None
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         stdout, stderr = await asyncio.wait_for(
@@ -1005,7 +1004,7 @@ async def _run_brev(*args: str, timeout: int = 30, stdin_data: str | None = None
             timeout=timeout,
         )
     except asyncio.TimeoutError:
-        proc.kill()
+        _kill_proc_group(proc)
         stdout, stderr = await proc.communicate()
         if stdout and stdout.strip():
             return ExecResult(
@@ -1279,40 +1278,6 @@ async def _check_instance_matches(instance: dict, req: dict) -> None:
     )
 
 
-async def _find_cheapest_matching_type(req: dict) -> str | None:
-    """Find the cheapest `brev search` instance type matching GPU requirements."""
-    result = await _run_brev("search", "--json", timeout=30)
-    search = (req.get("brev_search") or "").lower()
-    required_count = req.get("gpu_count", 1)
-    required_vram = req.get("min_vram_gb_per_gpu", 0)
-    required_disk = req.get("min_root_disk_gb", 0)
-
-    candidates = []
-    for inst in _parse_brev_json(result.stdout):
-        gpu_name = (inst.get("gpu_name") or "").lower()
-        gpu_count = int(inst.get("gpu_count", 0) or 0)
-        total_vram = float(inst.get("total_vram_gb", 0) or 0)
-        disk_min_gb = int(inst.get("disk_min_gb", 0) or 0)
-        if search and search not in gpu_name:
-            continue
-        if gpu_count < required_count:
-            continue
-        if required_vram and (total_vram / max(gpu_count, 1)) < required_vram:
-            continue
-        # Pre-filter by disk_min_gb.  Some providers misreport this (e.g.
-        # hyperstack lists ephemeral-disk size not root), so the live check
-        # in _check_live_resources is authoritative; this filter just prunes
-        # candidates that are obviously undersized.
-        if required_disk and disk_min_gb and disk_min_gb < required_disk:
-            continue
-        candidates.append(inst)
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: float(x.get("price_per_hour", 0) or 0))
-    return candidates[0].get("type")
-
-
 def _version_lt(a: str, b: str) -> bool:
     """Return True if NVIDIA driver version `a` is older than `b`.
 
@@ -1380,56 +1345,3 @@ async def _check_live_resources(instance_name: str, req: dict) -> None:
         )
 
 
-async def _suggest_registered_devices(req: dict) -> list[str]:
-    """Query `brev ls nodes --json` for registered physical devices that
-    match the task's requirements (best-effort, by name substring).
-    Returns human-readable strings for error messages."""
-    result = await _run_brev("ls", "nodes", "--json", timeout=15)
-    nodes = _parse_brev_json(result.stdout)
-    if not nodes:
-        return []
-    search = (req.get("brev_search") or req.get("gpu_type") or "").lower()
-    suggestions = []
-    for n in nodes:
-        name = n.get("name") or ""
-        status = n.get("status") or "?"
-        # Node entries don't include GPU specs; fall back to name matching.
-        # If search term appears in node name, it's a likely fit.
-        if search and search in name.lower():
-            suggestions.append(f"{name}  (status={status})  [name matches '{search}']")
-    # Also include all connected nodes as fallback suggestions.
-    if not suggestions:
-        for n in nodes:
-            if n.get("status") == "Connected":
-                suggestions.append(
-                    f"{n.get('name')}  (status=Connected)  "
-                    f"[GPU unknown — verify manually]"
-                )
-    return suggestions
-
-
-async def _wait_for_running(
-    name: str,
-    timeout_sec: int = 2400,
-    poll_interval: int = 15,
-) -> None:
-    """Poll `brev ls` until the named instance reaches RUNNING + shell READY."""
-    elapsed = 0
-    while elapsed < timeout_sec:
-        inst = await _find_brev_instance(name)
-        if inst:
-            status = inst.get("status")
-            shell = inst.get("shell_status")
-            if status == "FAILURE":
-                raise RuntimeError(f"Brev instance {name} creation FAILED")
-            if status == "RUNNING" and shell == "READY":
-                return
-            logger.info(
-                "Waiting for %s (status=%s shell=%s, %ds/%ds)",
-                name, status, shell, elapsed, timeout_sec,
-            )
-        await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
-    raise TimeoutError(
-        f"Brev instance {name} did not become ready within {timeout_sec}s"
-    )

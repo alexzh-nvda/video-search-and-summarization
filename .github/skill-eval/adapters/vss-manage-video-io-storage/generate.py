@@ -4,34 +4,45 @@
 """Generate Harbor tasks for the vss-manage-video-io-storage skill.
 
 The vss-manage-video-io-storage skill exercises VIOS (VST) API calls — upload video, extract
-snapshot URL, extract clip URL, etc. — against a **full-remote-deployed
-VSS base profile** (deploy mode = `remote-all`; LLM and VLM via remote
-endpoints, no local NIMs, no GPU inference on the host). It does NOT
-deploy VSS itself; the coordinator chains a deploy task in front.
+snapshot URL, extract clip URL, etc. The current spec
+([`skills/vss-manage-video-io-storage/evals/vios_ops.json`]) **omits the `profile` field
+by design** — the agent is expected to stand VIOS up standalone via the
+skill's bundled `references/deploy-vios-service.md` runbook before
+exercising the API. Per `.github/skill-eval/AGENTS.md` § 2, an absent
+`profile` is the supported signal to the harness that no
+`/vss-deploy-profile` prerequisite should be prepended; the trial runs
+directly on a bare Brev instance.
 
-Because VIOS/VST is GPU-independent and the deploy is remote-all, this
+Because VIOS/VST is mostly GPU-independent (only `streamprocessing-ms`
+uses NVDEC/NVENC, and no single-stream eval saturates one GPU), this
 adapter targets **ONE platform** by default (L40S — cheapest stoppable
-host). Use `--platform <X>` to override or `--all-platforms` if you
-really want the fan-out (not what the spec asks for).
+host with a working `nvidia-container-toolkit`). Use `--platform <X>`
+to override or `--all-platforms` if you really want the fan-out (not
+what the spec asks for).
 
-## Harbor chaining / dependencies
+## Deploy modes
 
-Harbor has no native mechanism to express inter-task dependencies
-(`TaskConfig` lacks a `depends_on` / `prerequisites` field). Each
-task is independent — Harbor runs exactly one task per trial on a
-clean environment.
+Harbor runs exactly one task per trial on a clean environment, and the
+skill-eval harness no longer pre-deploys any VSS profile on the agent's
+behalf. So whichever path the spec picks, the **agent's first turn**
+is responsible for bringing up whatever it needs:
 
-Chaining a vss-manage-video-io-storage trial *after* a deploy trial is a
-**coordinator-level** concern: the coordinator arranges that the
-target Brev instance already has VSS running before dispatching the
-vss-manage-video-io-storage trial. Our eval plan already models this with
-`execution_groups[<id>].queue_order` (sequential tasks on the same
-instance share state).
+1. **Profile-less spec (current `vios_ops.json` — `profile` absent):**
+   the instruction.md tells the agent to stand VIOS up standalone via
+   the skill's bundled `references/deploy-vios-service.md` runbook
+   (pre-authorized per the skill's "Pre-authorized autonomous mode"
+   branch). No `/vss-deploy-profile`.
 
-To chain: in the run plan, put deploy tasks first in a group's queue,
-then vss-manage-video-io-storage tasks for the same platform. Each task's
-`task.toml [metadata]` records `requires_deployed_vss=true` so a
-validator can refuse to dispatch it in isolation.
+2. **Profile-bound spec (e.g. `profile: "base"`):** the instruction.md
+   tells the agent to deploy the profile via
+   `/vss-deploy-profile -p <profile>` in its first turn, then run the
+   VIOS API queries against that profile's stack.
+
+In both cases `task.toml [metadata]` is purely informational — the
+harness no longer reads `profile`, `requires_deployed_vss`, or
+`prerequisite_deploy_mode` (those fields and the
+`_ensure_prerequisite_deployed` consumer were removed in the same
+refactor that motivated this docstring rewrite).
 
 ## Directory layout
 
@@ -39,7 +50,7 @@ validator can refuse to dispatch it in isolation.
         task.toml
         instruction.md
         tests/test.sh
-        tests/test_base_profile_ops.py    (copied from skill)
+        tests/vios_ops.json               (copied from skill)
         solution/solve.sh
         skills/vss-manage-video-io-storage/                (full skill copy)
         environment/Dockerfile            (FROM scratch; BrevEnvironment takes over)
@@ -75,10 +86,12 @@ PLATFORMS: dict[str, dict] = {
     "IGX-THOR":      {"short_name": "thor",          "gpu_type": "Thor",         "min_vram_per_gpu": 64, "brev_search": "Thor"},
 }
 
-# The vss-manage-video-io-storage skill exercises VIOS/VST, which is GPU-independent. The spec's
-# env field mandates a `remote-all` deploy (both LLM and VLM via remote
-# endpoints), so there's no value in fanning out to multiple platforms.
-# Default to the single cheapest host.
+# The vss-manage-video-io-storage skill exercises VIOS/VST. Only `streamprocessing-ms`
+# needs a GPU (NVDEC/NVENC); the rest is CPU. A single-stream eval is
+# trivially within one GPU. The current spec is also profile-less (the
+# agent stands VIOS up standalone per the skill's deploy contract), so
+# there is no value in fanning out to multiple platforms. Default to
+# the single cheapest GPU host.
 DEFAULT_PLATFORM = "L40S"
 
 DEFAULT_VIDEO_URL = (
@@ -170,17 +183,9 @@ def generate_task(platform: str, spec: dict, output_root: Path,
         lines = [
             PREAMBLE,
             "",
-            f"Use the `/vss-manage-video-io-storage` skill against the VSS base profile "
-            f"already running on this `{platform}` host "
-            "(`http://localhost:30888/vst/api/v1/sensor/version` must respond).",
-            "",
             f"## Query {idx} of {len(expects)}",
             "",
             expect.get("query", ""),
-            "",
-            "## Environment notes",
-            "",
-            spec.get("env", ""),
             "",
             "Run autonomously without prompting for confirmation.",
             "",
@@ -207,24 +212,31 @@ def generate_task(platform: str, spec: dict, output_root: Path,
             # default for JUDGE_MODEL would bake it in and short-circuit
             # the cascade — the proxy 401s the literal default outright.
             'ANTHROPIC_MODEL = "${ANTHROPIC_MODEL}"',
+            # JUDGE_MAX_TURNS bumped from the generic_judge.py:276 default
+            # of 25 because VIOS step trajectories run 6+ MB on a full
+            # 13-step thread (upload + sensor probes + replay + record).
+            # Checks that need to resolve a placeholder (e.g. <streamId>)
+            # from deep in the trajectory before issuing a live probe
+            # have been observed to exhaust the 25-turn budget — see the
+            # step-2 check 1 fail on PR #516's first eval run. 50 turns
+            # gives the per-check judge enough headroom to navigate the
+            # trajectory and emit a verdict without changing other
+            # skills' defaults.
+            'JUDGE_MAX_TURNS = "50"',
             "",
             "[metadata]",
             'skill = "vss-manage-video-io-storage"',
-            f'profile = "{spec.get("profile", "base")}"',
+            # `profile` is emitted ONLY when the spec declares one. The
+            # current vios_ops.json omits `profile` by design — the trial
+            # then runs without a /vss-deploy-profile prerequisite (per
+            # `.github/skill-eval/AGENTS.md` § 2) and the agent stands
+            # VIOS up standalone via the skill's deploy contract.
+            # Defaulting to "base" here would resurrect the wrong
+            # prerequisite-deploy behaviour silently.
             f'platform = "{platform}"',
             f'gpu_type = "{pspec["gpu_type"]}"',
             f'brev_search = "{pspec["brev_search"]}"',
             f'min_vram_gb_per_gpu = {pspec["min_vram_per_gpu"]}',
-            "requires_deployed_vss = true",
-            "# Deploy mode is FULL-REMOTE (LLM + VLM both remote) — vss-manage-video-io-storage",
-            "# exercises VIOS/VST only, so there's no benefit to running local NIMs.",
-            # prerequisite_deploy_mode is alerts-only — the deploy marker
-            # is profile-name only for base/lvs/search; the consumer
-            # (envs/brev_env.py::_ensure_prerequisite_deployed) matches
-            # on profile alone when this field is absent. Set it only if
-            # this spec needs a specific alerts stack (verification vs
-            # real-time).
-            *([f'prerequisite_deploy_mode = "{spec["prerequisite_deploy_mode"]}"'] if spec.get("prerequisite_deploy_mode") else []),
             f"step_index = {idx}",
             f"step_count = {len(expects)}",
             f"check_count = {len(expect.get('checks') or [])}",
@@ -243,12 +255,16 @@ def generate_task(platform: str, spec: dict, output_root: Path,
         (tests_dir / "test.sh").write_text(generate_test_script(idx, spec_name))
         if GENERIC_JUDGE.exists():
             shutil.copy(GENERIC_JUDGE, tests_dir / "generic_judge.py")
-        spec_src = skill_dir / "eval" / spec_name
+        spec_src = skill_dir / "evals" / spec_name
+        if not spec_src.exists():
+            legacy = skill_dir / "eval" / spec_name
+            if legacy.exists():
+                spec_src = legacy
         if spec_src.exists():
             shutil.copy(spec_src, tests_dir / spec_name)
         else:
             # write a copy of the spec even if the source file path differs
-            (tests_dir / "base_profile_ops.json").write_text(
+            (tests_dir / "vios_ops.json").write_text(
                 json.dumps(spec, indent=2)
             )
 
@@ -281,8 +297,8 @@ def main() -> None:
     parser.add_argument("--deploy-skill-dir", default=None,
                         help="Path to skills/vss-deploy-profile (optional — included for agent debug)")
     parser.add_argument("--spec", default=None,
-                        help="Path to base_profile_ops.json "
-                             "(default: <skill-dir>/eval/base_profile_ops.json)")
+                        help="Path to vios_ops.json "
+                             "(default: <skill-dir>/evals/vios_ops.json)")
     parser.add_argument("--platform", default=None,
                         choices=list(PLATFORMS.keys()),
                         help=f"Generate for this platform only "
@@ -292,7 +308,7 @@ def main() -> None:
                         help="Fan out across every platform in PLATFORMS — "
                              "only useful for skills whose spec explicitly "
                              "asks for a multi-platform matrix. VIOS "
-                             "does NOT: the base_profile_ops.json env says "
+                             "does NOT: the vios_ops.json env says "
                              "run on ONE platform.")
     parser.add_argument("--video-url", default=DEFAULT_VIDEO_URL,
                         help="Public .mp4 URL used by the verifier "
@@ -302,7 +318,14 @@ def main() -> None:
     output_root = Path(args.output_dir)
     skill_dir = Path(args.skill_dir)
     deploy_skill_dir = Path(args.deploy_skill_dir) if args.deploy_skill_dir else None
-    spec_path = Path(args.spec) if args.spec else (skill_dir / "eval" / "base_profile_ops.json")
+    if args.spec:
+        spec_path = Path(args.spec)
+    else:
+        spec_path = skill_dir / "evals" / "vios_ops.json"
+        if not spec_path.exists():
+            legacy = skill_dir / "eval" / "vios_ops.json"
+            if legacy.exists():
+                spec_path = legacy
 
     if not spec_path.exists():
         print(f"spec not found: {spec_path}", file=sys.stderr)
@@ -333,10 +356,18 @@ def main() -> None:
     print()
     print(f"Generated {len(platforms)} task(s) under {output_root}/base/")
     print()
-    print("Note: these tasks assume VSS base is already deployed on the target")
-    print("Brev instance. The coordinator (see .github/skill-eval/AGENTS.md) is")
-    print("responsible for injecting a matching deploy task ahead of each")
-    print("vss-manage-video-io-storage task in the same subagent queue.")
+    if spec.get("profile"):
+        print("Note: this spec declares a `profile` — the coordinator (see")
+        print(".github/skill-eval/AGENTS.md § 2) will inject a matching")
+        print("/vss-deploy-profile task ahead of each vss-manage-video-io-storage task in the same")
+        print("subagent queue.")
+    else:
+        print("Note: this spec OMITS `profile`. The trial runs on a bare Brev")
+        print("instance — no /vss-deploy-profile prerequisite is injected. The agent is")
+        print("expected to stand VIOS up standalone via the skill's bundled")
+        print("references/deploy-vios-service.md runbook (documents both")
+        print("direct-routing and SDRC-routed modes — either is acceptable) before")
+        print("exercising the API.")
 
 
 if __name__ == "__main__":

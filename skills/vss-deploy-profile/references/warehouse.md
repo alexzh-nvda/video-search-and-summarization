@@ -53,7 +53,6 @@ The warehouse blueprint boots the **full VSS stack** (agent + UI + VST + RTVI be
 | `vss-behavior-analytics` | Behavior analytics — ROI, tripwire, proximity events |
 | `kafka` or `redis` (`STREAM_TYPE`) | Message broker for CV metadata and control bus |
 | `vss-broker-health-check` | Waits for broker readiness before starting dependent services |
-| `vss-auto-calibration` (+ `vss-auto-calibration-ui`) | Camera auto-calibration |
 
 ### MV3DT CV core (`bp_wh_kafka_mv3dt` / `bp_wh_redis_mv3dt`)
 
@@ -70,11 +69,10 @@ MV3DT adds MQTT-based cross-camera messaging and BEV Fusion on top of per-camera
 | `vss-behavior-analytics-mv3dt` | Behavior analytics — 3D spatial analytics |
 | `kafka` or `redis` (`STREAM_TYPE`) | Message broker for CV metadata and control bus |
 | `vss-broker-health-check` | Waits for broker readiness before starting dependent services |
-| `vss-auto-calibration` (+ `vss-auto-calibration-ui`) | Camera auto-calibration |
 
 ### Warehouse Auto-Calibration (`bp_wh_auto_calib`)
 
-Deploys only the minimum services needed for camera calibration — no perception, no behavior analytics, no agent stack. Available for all modes (`bp_wh_auto_calib_2d`, `bp_wh_auto_calib_3d`, `bp_wh_auto_calib_mv3dt`). Skips broker health check.
+Deploys only the minimum services needed for camera calibration — no perception, no behavior analytics, no agent stack. Available for all modes (`bp_wh_auto_calib_2d`, `bp_wh_auto_calib_3d`, `bp_wh_auto_calib_mv3dt`). Skips broker health check. These are the only warehouse profiles that start `vss-auto-calibration` and `vss-auto-calibration-ui`; regular `bp_wh`, `bp_wh_kafka`, and `bp_wh_redis` profiles do not.
 
 | Container | Purpose |
 |---|---|
@@ -164,7 +162,7 @@ RTVI VLM has no equivalent mode setting — it is always deployed locally on `RT
 | Service | URL | Profile |
 |---|---|---|
 | NvStreamer UI | `http://<HOST_IP>:31000` | All |
-| Auto-Calibration UI | `http://<HOST_IP>:5000` | All |
+| Auto-Calibration UI | `http://<HOST_IP>:5000` | `auto_calib`, `bp_wh_auto_calib_2d`, `bp_wh_auto_calib_3d`, `bp_wh_auto_calib_mv3dt` |
 | Elasticsearch API | `http://<HOST_IP>:9200` | `bp_wh`, or kafka/redis extended |
 | VSS Agent API (direct) | `http://<HOST_IP>:8000` | `bp_wh` only (prefer `/api` via HAProxy) |
 | VST MCP (direct) | `http://<HOST_IP>:8001` | All |
@@ -239,13 +237,24 @@ LOG=${LOG:-/tmp/warehouse-blueprint.log}
 
 ### Lifecycle: Tear down
 
+Hard teardown — removes all containers, the project network, and all volume belonging to this stack.
+
 ```bash
 cd <repo>/deploy/docker
-docker compose -f compose.yml --env-file industry-profiles/warehouse-operations/.env down
+
+# Hard teardown — `-v` ensures named volumes are also removed.
+# Containers + network + project's named volumes all go.
+docker compose -f compose.yml --env-file industry-profiles/warehouse-operations/.env down -v
+
+# Sweep any leftover anonymous/dangling volumes from prior partial runs.
 docker volume prune -f
+
+# Reclaim disk: stopped containers, dangling images, unused networks.
 docker system prune -f
 
-# Pass the SAME env file you used with `docker compose --env-file ...`
+# Wipe bind-mounted state under $VSS_DATA_DIR/data_log/* AND revert
+# blueprint-configurator backups. Resolves VSS_DATA_DIR from the env file,
+# so pass the SAME env you used with `docker compose --env-file ...`.
 bash ./scripts/cleanup_all_datalog.sh -e industry-profiles/warehouse-operations/.env
 ```
 
@@ -278,9 +287,9 @@ docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 
 **Stack is ready when these show `Up`** (same container names in 2D and 3D; MV3DT uses `-mv3dt` suffix):
 
-- 2D / 3D profiles: `vss-vios-nvstreamer`, `vss-rtvi-cv`, `vss-configurator`, `vss-behavior-analytics`, `vss-auto-calibration`, `vss-auto-calibration-ui`, broker (`kafka` / `redis`), `vss-broker-health-check`, plus the `vss-vios-*` VST stack
+- 2D / 3D profiles: `vss-vios-nvstreamer`, `vss-rtvi-cv`, `vss-configurator`, `vss-behavior-analytics`, broker (`kafka` / `redis`), `vss-broker-health-check`, plus the `vss-vios-*` VST stack
 - 3D extra: `vss-rtvi-cv-config-adaptor`
-- MV3DT profiles: `vss-vios-nvstreamer-mv3dt`, `vss-rtvi-cv-mv3dt`, `vss-rtvi-cv-bev-fusion`, `mosquitto`, `vss-configurator-mv3dt`, `vss-behavior-analytics-mv3dt`, `vss-auto-calibration`, `vss-auto-calibration-ui`, broker (`kafka` / `redis`), `vss-broker-health-check`, plus VST stack
+- MV3DT profiles: `vss-vios-nvstreamer-mv3dt`, `vss-rtvi-cv-mv3dt`, `vss-rtvi-cv-bev-fusion`, `mosquitto`, `vss-configurator-mv3dt`, `vss-behavior-analytics-mv3dt`, broker (`kafka` / `redis`), `vss-broker-health-check`, plus VST stack
 - `bp_wh` extra: `vss-rtvi-vlm`, `vss-alert-bridge`, `vss-agent`, `vss-agent-ui`, `vss-va-mcp`, `vss-haproxy-ingress`, `phoenix`, plus the LLM NIM container (named after `LLM_NAME_SLUG`) when `LLM_MODE=local` / `local_shared`
 - Extended extra (kafka/redis, any mode): `vss-haproxy-ingress`, `logstash`, `kibana`, `vss-video-analytics-api` (MV3DT uses `vss-video-analytics-api-mv3dt`)
 - `elasticsearch`: `BP_PROFILE=bp_wh` (always), **or** kafka/redis with `MINIMAL_PROFILE=""` (extended, any mode)
@@ -328,18 +337,9 @@ Both set → skip to Phase 2.
 
 #### 1.2 Install (NGC CLI 4.10.0+)
 
-**AMD64:**
-```bash
-curl -sLo /tmp/ngccli.zip \
-  https://api.ngc.nvidia.com/v2/resources/nvidia/ngc-apps/ngc_cli/versions/4.10.0/files/ngccli_linux.zip
-sudo mkdir -p /usr/local/lib
-sudo unzip -qo /tmp/ngccli.zip -d /usr/local/lib
-sudo chmod +x /usr/local/lib/ngc-cli/ngc
-sudo ln -sfn /usr/local/lib/ngc-cli/ngc /usr/local/bin/ngc
-ngc --version
-```
-
-**ARM64 (DGX-SPARK, IGX-THOR):** use `ngccli_arm64.zip`, then same install steps.
+See [`ngc.md` § Install NGC CLI](ngc.md#install-ngc-cli-if-missing) for the
+AMD64 / ARM64 install commands. They are kept in `ngc.md` as the single
+canonical reference.
 
 #### 1.3 Configure API Key
 
@@ -383,7 +383,7 @@ Valid values: `H100, L40, L40S, L4, A6000, RTXA6000, RTXA6000ADA, RTXPRO6000BW, 
 | Discrete GPU (typical `nvidia-smi` name) | HARDWARE_PROFILE |
 |---|---|
 | RTX PRO 6000 Blackwell | `RTXPRO6000BW` |
-| RTX PRO 4500 Blackwell | `OTHER` — 32 GB; no dedicated profile, see [alerts.md § RTX PRO 4500](alerts.md#rtx-pro-4500-blackwell-32-gb) for the required `LLM_MODE=remote` env |
+| RTX 4500 Blackwell | `RTX4500` — 32 GB; see [alerts.md § RTX 4500](alerts.md#rtx-4500-32-gb) for the required `LLM_MODE=remote` + RT-VLM sizing overrides |
 | H100 (NVL, SXM HBM3) | `H100` |
 | RTX A6000 Ada Generation | `RTXA6000ADA` |
 | RTX A6000 (Ampere) | `RTXA6000` |
@@ -562,21 +562,7 @@ sudo systemctl daemon-reload && sudo systemctl restart docker
 
 #### 2.3 NVIDIA Container Toolkit
 
-```bash
-docker run --rm --gpus all ubuntu:24.04 nvidia-smi 2>&1 | head -8
-```
-
-If it fails:
-```bash
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
-  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-```
+Canonical install + verify lives in [`prerequisites.md` § 3 NVIDIA Container Toolkit](prerequisites.md#3-nvidia-container-toolkit). Run that block and re-verify with `docker run --rm --gpus all ubuntu:24.04 nvidia-smi` before continuing.
 
 #### 2.4 Linux Kernel Settings
 
@@ -645,15 +631,9 @@ df -h /  # 500 GB+ SSD
 
 #### Q2 — Blueprint Profile
 
-**MODE=2d:**
-> - **2D Vision AI** — CV-only, no LLM and no VLM. Profile: `bp_wh_kafka` or `bp_wh_redis`. Dataset: `warehouse-loading-dock-3cams-synthetic` (3 streams).
-> - **2D Vision AI with Agents** — LLM NIM (local/local_shared/remote) + RTVI VLM (always local). Profile: `bp_wh`. Dataset: `nv-warehouse-4cams` (4 streams).
-
-**MODE=3d:**
-> - **3D Vision AI** — `bp_wh_kafka` or `bp_wh_redis`. Dataset: `warehouse-4cams-20mx20m-synthetic` (4 streams).
-
-**MODE=mv3dt:**
-> - **MV3DT Vision AI** — `bp_wh_kafka` or `bp_wh_redis`. Dataset: `warehouse-4cams-20mx20m-synthetic` (4 streams). No agents profile (`bp_wh`) available.
+Refer to the [Profile Variants table](#profile-variants) above for the
+profile / mode / dataset matrix instead of restating it here. The question is
+just "which profile from that table?".
 
 #### Q3 — Stream Type
 
@@ -661,33 +641,23 @@ Skip for `bp_wh` and `bp_wh_auto_calib`. For `bp_wh_kafka` / `bp_wh_redis`:
 
 > "Which broker — **kafka** or **redis**?"
 
-Variable combinations:
+Variable combinations — pick one row matching the user's Vision-AI variant
+and stream type:
 
-```bash
-# 2D Vision AI — kafka:
-BP_PROFILE=bp_wh_kafka; STREAM_TYPE=kafka; SAMPLE_VIDEO_DATASET="warehouse-loading-dock-3cams-synthetic"; NUM_STREAMS=3
+| Vision AI | Stream type | `BP_PROFILE` | `STREAM_TYPE` | `SAMPLE_VIDEO_DATASET` | `NUM_STREAMS` |
+|---|---|---|---|---|---|
+| 2D Vision AI | kafka | `bp_wh_kafka` | `kafka` | `warehouse-loading-dock-3cams-synthetic` | 3 |
+| 2D Vision AI | redis | `bp_wh_redis` | `redis` | `warehouse-loading-dock-3cams-synthetic` | 3 |
+| 2D Vision AI with Agents | n/a | `bp_wh` | — | `nv-warehouse-4cams` | 4 (also set `LLM_MODE=local`; RTVI VLM is always local) |
+| 3D Vision AI | kafka | `bp_wh_kafka` | `kafka` | `warehouse-4cams-20mx20m-synthetic` | 4 |
+| 3D Vision AI | redis | `bp_wh_redis` | `redis` | `warehouse-4cams-20mx20m-synthetic` | 4 |
+| MV3DT Vision AI | kafka | `bp_wh_kafka` | `kafka` | `warehouse-4cams-20mx20m-synthetic` | 4 |
+| MV3DT Vision AI | redis | `bp_wh_redis` | `redis` | `warehouse-4cams-20mx20m-synthetic` | 4 |
+| Warehouse Auto-Calibration | n/a | `bp_wh_auto_calib` | — | mode-specific default | mode-specific default (also set `LLM_MODE=none`) |
 
-# 2D Vision AI — redis:
-BP_PROFILE=bp_wh_redis; STREAM_TYPE=redis; SAMPLE_VIDEO_DATASET="warehouse-loading-dock-3cams-synthetic"; NUM_STREAMS=3
-
-# 2D Vision AI with Agents (RTVI VLM is always local; only LLM_MODE is selectable):
-BP_PROFILE=bp_wh; SAMPLE_VIDEO_DATASET="nv-warehouse-4cams"; NUM_STREAMS=4; LLM_MODE=local
-
-# 3D Vision AI — kafka:
-BP_PROFILE=bp_wh_kafka; STREAM_TYPE=kafka; SAMPLE_VIDEO_DATASET="warehouse-4cams-20mx20m-synthetic"; NUM_STREAMS=4
-
-# 3D Vision AI — redis:
-BP_PROFILE=bp_wh_redis; STREAM_TYPE=redis; SAMPLE_VIDEO_DATASET="warehouse-4cams-20mx20m-synthetic"; NUM_STREAMS=4
-
-# MV3DT Vision AI — kafka:
-BP_PROFILE=bp_wh_kafka; STREAM_TYPE=kafka; SAMPLE_VIDEO_DATASET="warehouse-4cams-20mx20m-synthetic"; NUM_STREAMS=4
-
-# MV3DT Vision AI — redis:
-BP_PROFILE=bp_wh_redis; STREAM_TYPE=redis; SAMPLE_VIDEO_DATASET="warehouse-4cams-20mx20m-synthetic"; NUM_STREAMS=4
-
-# Warehouse Auto-Calibration (mode-specific — dataset/streams match the mode default):
-BP_PROFILE=bp_wh_auto_calib; LLM_MODE=none
-```
+`3D Vision AI` and `MV3DT Vision AI` intentionally share the same dataset and
+stream counts — they differ only at the perception layer (`Sparse4D` vs
+per-camera DeepStream + BEV Fusion).
 
 #### Q4 — Deployment Profile
 
@@ -722,7 +692,7 @@ MINIMAL_PROFILE=""       # extended
 
   Deploy the chosen calibration profile first, generate the calibration JSON via the Auto-Calibration UI (`http://<HOST_IP>:5000`).
 
-  > **Note:** For 3D / MV3DT with own data, calibration files additionally require BEV clustering — see [Calibration Generation](#calibration-generation).
+  > **Note:** Post-calibration cleanup depends on mode. In 2D, Auto-Calibration adds blank `group` and `region` fields to `calibration.json`; they are not required for 2D and should be removed. For 3D / MV3DT, calibration files require camera clustering to populate `sensors[].group` — see [Calibration Generation](#calibration-generation).
 
   Once the calibration file is ready, redeploy with the full warehouse profile.
 
@@ -869,9 +839,38 @@ Two paths are available to generate calibration files depending on your video so
 
 Both paths deploy `vss-auto-calibration` + `vss-auto-calibration-ui` and produce calibration JSON files consumable by behavior-analytics.
 
+### 2D calibration cleanup
+
+In 2D, Auto-Calibration adds blank `group` and `region` fields to the generated `calibration.json`. These fields are not required for 2D calibration and should be removed before redeploying the full warehouse profile.
+
 ### Camera Clustering (3D / MV3DT only)
 
-Use `create_camera_clusters.py` to partition cameras into non-overlapping groups for separate 3D model instances. Use `--n_clusters 1` for a single group. Docs: https://docs.nvidia.com/vss/3.1.0/warehouse-docs/3D-profile.html#camera-clustering
+After calibration is generated via Auto-Calibration, run camera clustering before redeploying the full warehouse profile. For 3D/MV3DT, the required field lives directly on each camera sensor as `sensors[].group`. The warehouse blueprint docker compose setup uses one BEV group, so run the clustering tool with `--n_clusters 1` and then verify the group field is present.
+
+```bash
+CALIBRATION_JSON=/path/to/calibration.json
+REPO_ROOT=/path/to/video-search-and-summarization
+SDU_DIR="${REPO_ROOT}/libs/analytics/spatialai-data-utils"
+SENSOR_COUNT=$(jq '.sensors | length' "${CALIBRATION_JSON}")
+
+PYTHONPATH="${SDU_DIR}:${PYTHONPATH:-}" python3 \
+  "${SDU_DIR}/tools/camera_grouping/create_camera_clusters.py" \
+  "${CALIBRATION_JSON}" \
+  --max_camera_per_group "${SENSOR_COUNT}" \
+  --n_clusters 1 \
+  --disable_param_tuning \
+  --overwrite
+```
+
+Docs: 3D https://docs.nvidia.com/vss/3.2.0/warehouse-docs/3D-profile.html#camera-clustering and for mv3dt, https://docs.nvidia.com/vss/3.2.0/warehouse-docs/mv3dt-profile.html#camera-clustering
+
+### MV3DT-specific configuration updates
+
+When adding new cameras to the MV3DT profile, run the MV3DT utility scripts under `tools/rtvi-cv-mv3dt-utils` after calibration and camera clustering are complete, and before redeploying the full warehouse profile. These scripts generate the MV3DT-specific files consumed by the per-camera tracker and MQTT communication layer:
+
+1. **Camera information files** (`camInfo/<sensor_id>.yml`) — each camera requires a `camInfo` file containing the 3x4 projection matrix and per-class object model dimensions, generated from `calibration.json`.
+2. **MQTT publish/subscribe configuration** (`pub_sub_info_config.yml`) — defines the inter-camera communication graph for MV3DT by generating a vision-neighbor graph from camera calibration data.
+3. **Tracker configuration** (`ds-mv3dt-tracker-config.yml`) — ensure the `ObjectModelProjection.cameraModelFilepath` section maps each sensor ID to its corresponding `camInfo` file.
 
 ---
 

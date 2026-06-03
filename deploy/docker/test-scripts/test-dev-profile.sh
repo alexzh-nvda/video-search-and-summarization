@@ -437,6 +437,14 @@ echo "NVIDIA H100 80GB HBM3"
 EOF
 chmod +x "${_mock_nvidia_smi_dir}/nvidia-smi"
 PATH="${_mock_nvidia_smi_dir}:${PATH}" SKIP_HARDWARE_CHECK= run_dry_run_test "OTHER accepted when detected GPU is supported" up -p base -i 127.0.0.1 -H OTHER -d
+_mock_rtx4500_nvidia_smi_dir="$(mktemp -d)"
+CLEANUP_DIRS+=("${_mock_rtx4500_nvidia_smi_dir}")
+cat > "${_mock_rtx4500_nvidia_smi_dir}/nvidia-smi" <<'EOF'
+#!/bin/bash
+echo "NVIDIA RTX PRO 4500 Blackwell"
+EOF
+chmod +x "${_mock_rtx4500_nvidia_smi_dir}/nvidia-smi"
+PATH="${_mock_rtx4500_nvidia_smi_dir}:${PATH}" SKIP_HARDWARE_CHECK= run_dry_run_test "RTXPRO4500BW accepted when detected GPU is RTX PRO 4500 Blackwell" up -p base -i 127.0.0.1 -H RTXPRO4500BW -d
 run_negative_test "DGX-SPARK only valid for base or alerts (not lvs)" 1 up -p lvs -i 127.0.0.1 -H DGX-SPARK
 run_negative_test "DGX-SPARK only valid for base or alerts (not search)" 1 up -p search -i 127.0.0.1 -H DGX-SPARK
 run_negative_test "alerts without --mode" 1 up -p alerts -i 127.0.0.1
@@ -553,6 +561,12 @@ run_dry_run_up_and_check_generated_env "generated.env alerts RTXPRO6000BW local 
 run_dry_run_up_and_check_generated_env "generated.env alerts L40S local RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.8" "alerts" \
   -i 127.0.0.1 -m verification -H L40S --llm-device-id 2 --vlm-device-id 1 -d -- \
   "RTVI_VLLM_GPU_MEMORY_UTILIZATION" "0.8"
+run_dry_run_up_and_check_generated_env "generated.env alerts RTXPRO4500BW RTVI tuning" "alerts" \
+  -i 127.0.0.1 -m verification -H RTXPRO4500BW -d -- \
+  "RTVI_VLLM_GPU_MEMORY_UTILIZATION" "0.8" "RTVI_VLM_MAX_MODEL_LEN" "20480" "RTVI_VLM_MODEL_PATH" "ngc:nim/nvidia/cosmos-reason2-8b:hf-1208" "VLM_NAME" "nim_nvidia_cosmos-reason2-8b_hf-1208"
+run_dry_run_up_and_check_generated_env "generated.env lvs RTXPRO4500BW RTVI tuning" "lvs" \
+  -i 127.0.0.1 -H RTXPRO4500BW -d -- \
+  "RTVI_VLLM_GPU_MEMORY_UTILIZATION" "0.8" "RTVI_VLM_MAX_MODEL_LEN" "20480" "RTVI_VLM_MODEL_PATH" "ngc:nim/nvidia/cosmos-reason2-8b:hf-1208" "VLM_NAME" "nim_nvidia_cosmos-reason2-8b_hf-1208"
 run_dry_run_up_and_check_generated_env "generated.env alerts OTHER RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.7" "alerts" \
   -i 127.0.0.1 -m verification -H OTHER -d -- \
   "RTVI_VLLM_GPU_MEMORY_UTILIZATION" "0.7"
@@ -646,6 +660,7 @@ run_dry_run_test "up base dry-run" up -p base -i 127.0.0.1 -d
 run_dry_run_test "up search dry-run" up -p search -i 127.0.0.1 --dry-run
 run_dry_run_test "up lvs dry-run" up -p lvs -i 127.0.0.1 -d
 run_dry_run_test "up alerts dry-run with mode verification" up -p alerts -i 127.0.0.1 -m verification -d
+run_dry_run_test "up base with hardware-profile RTXPRO4500BW" up -p base -i 127.0.0.1 -H RTXPRO4500BW -d
 run_dry_run_test "up base with hardware-profile RTXPRO6000BW" up -p base -i 127.0.0.1 -H RTXPRO6000BW -d
 run_dry_run_test "up base with hardware-profile OTHER" up -p base -i 127.0.0.1 -H OTHER -d
 run_dry_run_test "up base with llm/vlm" up -p base -i 127.0.0.1 --llm nvidia/nemotron-3-nano --vlm nvidia/cosmos-reason1-7b -d
@@ -776,6 +791,9 @@ rm -f "${_out_search}"
 run_dry_run_up_and_check_generated_env "generated.env HOST_IP and HARDWARE_PROFILE from options" "base" \
  -i 127.0.0.1 -H RTXPRO6000BW -d -- \
   "HOST_IP" "127.0.0.1" "HARDWARE_PROFILE" "RTXPRO6000BW"
+run_dry_run_up_and_check_generated_env "generated.env HARDWARE_PROFILE RTXPRO4500BW" "base" \
+ -i 127.0.0.1 -H RTXPRO4500BW -d -- \
+  "HARDWARE_PROFILE" "RTXPRO4500BW"
 run_dry_run_up_and_check_generated_env "generated.env HARDWARE_PROFILE OTHER" "base" \
  -i 127.0.0.1 -H OTHER -d -- \
   "HARDWARE_PROFILE" "OTHER"

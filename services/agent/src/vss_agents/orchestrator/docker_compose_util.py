@@ -577,13 +577,21 @@ def build_resolved_env(config: DryRunRecipe) -> dict[str, str]:
     if external_ip != host_ip:
         merged["EXTERNAL_IP"] = external_ip
 
-    brev_env_id = first_non_placeholder(
+    disable_brev_proxy_env = first_non_placeholder(
         [
-            config.env_overrides.get("BREV_ENV_ID", ""),
-            os.environ.get("BREV_ENV_ID", ""),
-            read_etc_environment().get("BREV_ENV_ID", ""),
+            config.env_overrides.get("VSS_DISABLE_BREV_PROXY_ENV", ""),
+            os.environ.get("VSS_DISABLE_BREV_PROXY_ENV", ""),
         ]
-    )
+    ).lower() in {"1", "true", "yes"}
+    brev_env_id = ""
+    if not disable_brev_proxy_env:
+        brev_env_id = first_non_placeholder(
+            [
+                config.env_overrides.get("BREV_ENV_ID", ""),
+                os.environ.get("BREV_ENV_ID", ""),
+                read_etc_environment().get("BREV_ENV_ID", ""),
+            ]
+        )
     if brev_env_id:
         apply_brev_proxy_env(merged, brev_env_id)
 
@@ -726,11 +734,17 @@ def sanitize_resolved_compose(compose_text: str) -> str:
 
 def generate_dry_run_artifacts(config: DryRunRecipe) -> tuple[dict[str, str], Path, Path]:
     resolved_env = build_resolved_env(config)
-    config.output_env_file.parent.mkdir(parents=True, exist_ok=True)
-    config.output_env_file.write_text(render_generated_env(config.source_env_file, resolved_env))
-    config.output_compose_file.parent.mkdir(parents=True, exist_ok=True)
-    config.output_compose_file.write_text(resolve_compose(config))
-    return resolved_env, config.output_env_file, config.output_compose_file
+    env_file = config.output_env_file
+    compose_file = config.output_compose_file
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text(  # NOSONAR S2083: --output-env-file is an intentional CLI destination
+        render_generated_env(config.source_env_file, resolved_env)
+    )
+    compose_file.parent.mkdir(parents=True, exist_ok=True)
+    compose_file.write_text(  # NOSONAR S2083: --output-compose-file is an intentional CLI destination
+        resolve_compose(config)
+    )
+    return resolved_env, env_file, compose_file
 
 
 def print_configuration_summary(config: DryRunRecipe, resolved_env: dict[str, str]) -> None:

@@ -144,6 +144,9 @@ PROFILES: dict[str, dict] = {
     "search": {
         "description": "VSS search profile — Cosmos Embed1 semantic search",
     },
+    "warehouse": {
+        "description": "VSS warehouse blueprint — RT-DETR 2D (`bp_wh_2d`) with always-local RTVI VLM, agent, UI, behavior analytics, Kafka",
+    },
 }
 
 
@@ -170,11 +173,11 @@ def deploy_profile(eval_profile: str) -> str:
 _DEFAULT_MIN_ROOT_DISK_GB = 220        # base stack ~80GB + 2 local NIMs ~70GB each
 _DEFAULT_MIN_DRIVER_VERSION = "580.95" # cosmos-reason2-8b:1.6.0 floor
 # Caveats — both defaults are enforced unconditionally by
-# `envs/brev_env.py::_check_live_resources` / `_find_cheapest_matching_type`:
+# `envs/brev_env.py::_check_live_resources` on the resolved pool box:
 # - The disk default would reject otherwise-eligible smaller-root
-#   providers (e.g. some launchpad boxes) for trials that end up
-#   running fully remote and would actually fit on <220GB. Acceptable
-#   today because every `vss-eval-*` pool member has ≥220GB.
+#   pool members for trials that end up running fully remote and would
+#   actually fit on <220GB. Acceptable today because every `vss-eval-*`
+#   pool member has ≥220GB.
 # - The driver default is skipped when `nvidia-smi` is absent (the
 #   resource check warns instead of erroring), so CPU-only boxes still
 #   pass; don't tighten that branch to a hard error without revisiting
@@ -269,32 +272,12 @@ def generate_test_script(spec_name: str, profile: str) -> str:
     against the rendered eval spec shipped alongside it. Harbor reads
     /logs/verifier/reward.txt.
 
-    On a full-pass (reward == 1.0), OVERWRITES the canonical active
-    marker `/tmp/skill-eval/active-deploy.txt` with this trial's
-    `<underlying_profile>` (plus `-<deploy_mode>` only for alerts) so
-    dependent trials (vss-manage-video-io-storage, video-*) reading the marker via
-    `BrevEnvironment._ensure_prerequisite_deployed` see what is currently
-    RUNNING on the box. See specs/stale-marker.spec.
-
-    Marker format:
-      - `base`, `lvs`, `search` — profile name only (placement is
-        env-driven, not a marker dimension).
-      - `alerts-verification`, `alerts-real-time` — alerts has two
-        distinct stacks (`/vss-deploy-profile -m verification` vs `-m real-time`)
-        so the mode is part of the marker.
-
-    Consumer (`_ensure_prerequisite_deployed`) builds its desired
-    marker the same way: `profile + ("-" + prerequisite_deploy_mode if
-    set else "")`. Non-alerts downstream adapters declare just
-    `profile`; the alerts downstream case additionally declares
-    `prerequisite_deploy_mode`."""
-    underlying_profile = deploy_profile(profile)
-    deploy_mode_token = PROFILES[profile].get("deploy_mode")
-    marker_token = (
-        f"{underlying_profile}-{deploy_mode_token}"
-        if deploy_mode_token
-        else underlying_profile
-    )
+    No `profile` argument is needed by the script itself anymore — the
+    harness used to consume the deployed-profile marker written here
+    for instance reuse, but that machinery (active-deploy.txt +
+    `_ensure_prerequisite_deployed`) is gone. Each trial deploys
+    inside its own agent turn now; nothing reads a marker."""
+    del profile  # retained in signature for caller compatibility
     return (
         "#!/bin/bash\n"
         "# vss-deploy-profile verifier: delegates to the generic LLM-as-judge\n"
@@ -309,16 +292,6 @@ def generate_test_script(spec_name: str, profile: str) -> str:
         'python3 "$TEST_DIR/generic_judge.py" \\\n'
         f'    --spec "$TEST_DIR/{spec_name}" --step 1\n'
         "\n"
-        "# On full pass, overwrite the canonical active-deploy marker so\n"
-        "# downstream trials (vss-manage-video-io-storage/vss-*) reuse the running deployment\n"
-        "# instead of re-running /vss-deploy-profile. Overwrite, never append — the\n"
-        "# marker is what is currently RUNNING, not a deploy log.\n"
-        'reward="$(cat /logs/verifier/reward.txt 2>/dev/null || echo 0)"\n'
-        f'if [ "$reward" = "1.0" ] || [ "$reward" = "1" ]; then\n'
-        f'  mkdir -p /tmp/skill-eval && '
-        f"printf '%s\\n' '{marker_token}' "
-        f"> /tmp/skill-eval/active-deploy.txt\n"
-        "fi\n"
         "exit 0\n"
     )
 
@@ -334,16 +307,34 @@ def generate_solve_script(profile: str, platform: str) -> str:
     the agent's `/vss-deploy-profile` skill reads the forwarded env vars
     (`LLM_REMOTE_URL`, `VLM_REMOTE_URL`, `NGC_CLI_API_KEY`) and picks
     placement itself.
+
+    warehouse uses a different .env path:
+        `<repo>/deploy/docker/industry-profiles/warehouse-operations/.env`
+    All other core profiles use:
+        `<repo>/deployments/developer-workflow/dev-profile-<profile>/.env`
     """
     env_profile = deploy_profile(profile)
     deploy_flag_m = PROFILES[profile].get("deploy_mode")
 
-    overrides: dict[str, str] = {
-        "HARDWARE_PROFILE": platform,
-        "VSS_APPS_DIR": "$REPO/deployments",
-        "VSS_DATA_DIR": "$REPO/data",
-        "HOST_IP": "$(hostname -I | awk '{print $1}')",
-    }
+    is_warehouse = (env_profile == "warehouse")
+
+    if is_warehouse:
+        env_file_line = 'ENV_FILE=$REPO/deploy/docker/industry-profiles/warehouse-operations/.env'
+        overrides: dict[str, str] = {
+            "HARDWARE_PROFILE": platform,
+            "VSS_APPS_DIR": "$REPO/deploy/docker",
+            "VSS_DATA_DIR": "$REPO/data",
+            "HOST_IP": "$(hostname -I | awk '{print $1}')",
+        }
+    else:
+        env_file_line = 'ENV_FILE=$REPO/deployments/developer-workflow/dev-profile-$PROFILE/.env'
+        overrides = {
+            "HARDWARE_PROFILE": platform,
+            "VSS_APPS_DIR": "$REPO/deployments",
+            "VSS_DATA_DIR": "$REPO/data",
+            "HOST_IP": "$(hostname -I | awk '{print $1}')",
+        }
+
     sed_lines = "\n".join(
         'sed -i "s|^' + k + "=.*|" + k + "=" + v + '|" "$ENV_FILE"'
         for k, v in overrides.items()
@@ -408,7 +399,7 @@ def generate_solve_script(profile: str, platform: str) -> str:
         "",
         "# --- Configure .env ---",
         f"PROFILE={env_profile}",
-        'ENV_FILE=$REPO/deployments/developer-workflow/dev-profile-$PROFILE/.env',
+        env_file_line,
         "",
         sed_lines,
         "",
@@ -417,7 +408,7 @@ def generate_solve_script(profile: str, platform: str) -> str:
         "fi",
         "",
         f"# --- Deploy ({deploy_args}) ---",
-        "cd $REPO/deployments",
+        "cd $REPO/deploy/docker" if is_warehouse else "cd $REPO/deployments",
         "docker compose --env-file $ENV_FILE config 2>/dev/null > resolved.yml",
         "docker compose -f resolved.yml up -d",
         "",
@@ -470,26 +461,16 @@ def generate_task(
         'skills_dir = "/skills"',
         "",
         "[metadata]",
-        # Intentionally NOT emitting `profile = "{profile}"` here. For
-        # vss-deploy-profile/eval/<X>.json the trial IS the deploy — it
-        # invokes /vss-deploy-profile -p X via its own prompt. Setting
-        # `profile` in [metadata] would trick BrevEnvironment's
-        # _ensure_prerequisite_deployed into running an extra sub-claude
-        # `claude --print /vss-deploy-profile -p X` BEFORE the trial agent,
-        # which is both redundant and (observed on run 26066279318) prone
-        # to picking the wrong profile when the box's stale active-deploy
-        # marker points at a different profile. Per the spec authors:
-        # absent `profile` → BrevEnvironment runs its box-clean path
-        # (`desired=""`) which wipes containers/networks/volumes and
-        # clears the marker, then the trial runs from a guaranteed-clean
-        # state. The `platform` key below is purely informational.
+        # No `profile = "..."` is emitted — nothing in the harness reads
+        # it anymore. The trial's first agent turn invokes
+        # /vss-deploy-profile -p X via its own prompt; the prior
+        # _ensure_prerequisite_deployed pre-deploy hook is gone. The
+        # `platform` key below is purely informational.
         f'platform = "{platform}"',
     ]
     deploy_flag_m = profile_def.get("deploy_mode")
     if deploy_flag_m:
-        # Informational — does NOT match BrevEnvironment's
-        # `prerequisite_deploy_mode` field used by downstream consumers,
-        # so this is safe to emit here without triggering prereq logic.
+        # Informational — no harness consumer.
         meta_lines.append(f'deploy_mode = "{deploy_flag_m}"')
     meta_lines += [
         "# GPU requirements — BrevEnvironment checks these against the",
@@ -524,7 +505,14 @@ def generate_task(
     # -- tests/: wrapper + generic judge + rendered eval spec --
     tests_dir = task_dir / "tests"
     tests_dir.mkdir(exist_ok=True)
-    spec_path = skill_dir / "eval" / f"{profile}.json" if skill_dir else None
+    if skill_dir:
+        spec_path = skill_dir / "evals" / f"{profile}.json"
+        if not spec_path.exists():
+            legacy = skill_dir / "eval" / f"{profile}.json"
+            if legacy.exists():
+                spec_path = legacy
+    else:
+        spec_path = None
     if spec_path and spec_path.exists():
         raw_spec = json.loads(spec_path.read_text())
         rendered = _render_eval_spec(raw_spec, profile, platform)
@@ -536,7 +524,7 @@ def generate_task(
     else:
         (tests_dir / "test.sh").write_text(
             "#!/bin/bash\n"
-            f"echo 'FAIL: no eval spec at skills/vss-deploy-profile/eval/{profile}.json' >&2\n"
+            f"echo 'FAIL: no eval spec at skills/vss-deploy-profile/evals/{profile}.json' >&2\n"
             "mkdir -p /logs/verifier\n"
             "echo 0 > /logs/verifier/reward.txt\n"
             "exit 0\n"
@@ -562,7 +550,8 @@ def generate_task(
 # ---------------------------------------------------------------------------
 
 def _spec_platforms_for(profile: str, skill_dir: Path | None) -> dict[str, int] | None:
-    """Read `eval/<profile>.json` and return `{platform: gpu_count}`.
+    """Read `evals/<profile>.json` (legacy `eval/<profile>.json` accepted)
+    and return `{platform: gpu_count}`.
     Return None if the spec doesn't declare `resources.platforms` (the
     spec is required to ship a `gpu_count` per platform — there is no
     adapter-side fallback matrix any more).
@@ -572,7 +561,11 @@ def _spec_platforms_for(profile: str, skill_dir: Path | None) -> dict[str, int] 
     A warning is printed so authors notice the dead field."""
     if skill_dir is None:
         return None
-    spec_path = skill_dir / "eval" / f"{profile}.json"
+    spec_path = skill_dir / "evals" / f"{profile}.json"
+    if not spec_path.exists():
+        legacy = skill_dir / "eval" / f"{profile}.json"
+        if legacy.exists():
+            spec_path = legacy
     if not spec_path.exists():
         return None
     try:
@@ -621,7 +614,7 @@ def expand_matrix(
             continue
         spec_matrix = _spec_platforms_for(profile, skill_dir)
         if spec_matrix is None:
-            skipped.append((profile, "-", "no spec at skills/vss-deploy-profile/eval/"
+            skipped.append((profile, "-", "no spec at skills/vss-deploy-profile/evals/"
                                           f"{profile}.json with resources.platforms"))
             continue
         for platform, spec_gpu_count in spec_matrix.items():

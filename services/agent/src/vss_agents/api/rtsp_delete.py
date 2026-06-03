@@ -37,9 +37,11 @@ from vss_agents.api.rtsp_ingest import _resolve_service_config
 from vss_agents.api.rtsp_ingest import cleanup_rtvi_cv
 from vss_agents.api.rtsp_ingest import cleanup_rtvi_embed_generation
 from vss_agents.api.rtsp_ingest import cleanup_rtvi_embed_stream
+from vss_agents.api.rtsp_ingest import cleanup_rtvi_vlm_stream
 from vss_agents.api.rtsp_ingest import cleanup_vst_sensor
 from vss_agents.api.rtsp_ingest import cleanup_vst_storage
 from vss_agents.api.rtsp_ingest import get_stream_info_by_name
+from vss_agents.utils.sanitize import scrub_log
 
 logger = logging.getLogger(__name__)
 
@@ -84,18 +86,18 @@ def create_rtsp_delete_router(config: ServiceConfig) -> APIRouter:
         """
         results: list[bool] = []
 
-        logger.info(f"Deleting stream by name '{name}'")
+        logger.info("Deleting stream by name '%s'", scrub_log(name))
 
         success, msg, stream_id, rtsp_url = await get_stream_info_by_name(config, name)
         if not success:
-            logger.error(f"Failed to find stream '{name}': {msg}")
+            logger.error("Failed to find stream '%s': %s", scrub_log(name), scrub_log(msg))
             return DeleteStreamResponse(
                 status="failure",
                 message=f"Failed to find stream with name '{name}': {msg}",
                 name=name,
             )
 
-        logger.info(f"Found stream_id '{stream_id}' for name '{name}'")
+        logger.info("Found stream_id '%s' for name '%s'", scrub_log(stream_id), scrub_log(name))
         if stream_id is None:
             return DeleteStreamResponse(
                 status="failure",
@@ -106,7 +108,7 @@ def create_rtsp_delete_router(config: ServiceConfig) -> APIRouter:
         # RTVI cleanup runs only when at least one RTVI URL is configured.
         # The individual cleanup helpers self-skip when their URL is empty,
         # but we avoid opening an httpx client when nothing's configured.
-        if config.rtvi_embed_url or config.rtvi_cv_url:
+        if config.rtvi_embed_url or config.rtvi_cv_url or config.rtvi_vlm_url:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 success, msg = await cleanup_rtvi_embed_generation(client, config, stream_id)
                 results.append(success)
@@ -119,6 +121,10 @@ def create_rtsp_delete_router(config: ServiceConfig) -> APIRouter:
                 success, msg = await cleanup_rtvi_cv(client, config, stream_id, name=name, sensor_url=rtsp_url or "")
                 results.append(success)
                 logger.info(f"Delete from RTVI-CV: {'OK' if success else msg}")
+
+                success, msg = await cleanup_rtvi_vlm_stream(client, config, stream_id)
+                results.append(success)
+                logger.info(f"Delete from RTVI-VLM: {'OK' if success else msg}")
 
         success, msg = await cleanup_vst_sensor(config, stream_id)
         results.append(success)
@@ -142,7 +148,7 @@ def create_rtsp_delete_router(config: ServiceConfig) -> APIRouter:
             status = "failure"
             message = f"Failed to delete stream '{name}'"
 
-        logger.info(f"Delete stream '{name}' completed with status: {status}")
+        logger.info("Delete stream '%s' completed with status: %s", scrub_log(name), status)
 
         return DeleteStreamResponse(
             status=status,

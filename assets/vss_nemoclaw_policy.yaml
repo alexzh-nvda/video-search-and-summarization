@@ -65,6 +65,26 @@ network_policies:
       - { path: /usr/local/bin/openclaw }
       - { path: /usr/local/bin/node }
 
+  ngc:
+    # Hosts verified by `ngc --debug registry resource download-version
+    # nvidia/vss-developer/dev-profile-sample-data:3.1.0` — only api.ngc and
+    # authn.nvidia are contacted; file payloads stream over api.ngc.nvidia.com.
+    # curl is needed because deploy_nemoclaw_vss.ipynb bootstraps the NGC CLI
+    # itself via `curl -fL -o ngc_cli.zip
+    # https://api.ngc.nvidia.com/v2/resources/nvidia/ngc-apps/ngc_cli/...`
+    # before /usr/local/bin/ngc exists in the sandbox.
+    name: ngc
+    endpoints:
+      - host: api.ngc.nvidia.com
+        port: 443
+        access: full
+      - host: authn.nvidia.com
+        port: 443
+        access: full
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/ngc }
+
   github:
     name: github
     endpoints:
@@ -83,12 +103,23 @@ network_policies:
     endpoints:
       - host: clawhub.ai
         port: 443
+        access: full
+        tls: skip
+      - host: registry.clawhub.ai
+        port: 443
         protocol: rest
         enforcement: enforce
         tls: terminate
         rules:
           - allow: { method: GET, path: "/**" }
           - allow: { method: POST, path: "/**" }
+      - host: cdn.clawhub.ai
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
     binaries:
       - { path: /usr/local/bin/openclaw }
       - { path: /usr/local/bin/node }
@@ -347,54 +378,6 @@ network_policies:
           - 172.20.0.0/16
       - host: host.openshell.internal
         port: 38112
-        access: full
-        allowed_ips:
-          - 172.17.0.0/16
-          - 172.18.0.0/16
-          - 172.20.0.0/16
-      # HAProxy ingress (7777, browser-facing proxy for Brev / warehouse UI),
-      # RT-CV health (9000, alerts MODE=2d_cv perception probe),
-      # alert-notify webhook relay (9090, local notification fanout server),
-      # Milvus vector DB (19530, vss-generate-video-report-rag knowledge retrieval),
-      # LLM NIM (30081), VLM NIM (30082) — both referenced by the deploy + report
-      # skills for /v1/models probes and RTVI_VLM_BASE_URL defaults.
-      - host: host.openshell.internal
-        port: 7777
-        access: full
-        allowed_ips:
-          - 172.17.0.0/16
-          - 172.18.0.0/16
-          - 172.20.0.0/16
-      - host: host.openshell.internal
-        port: 9000
-        access: full
-        allowed_ips:
-          - 172.17.0.0/16
-          - 172.18.0.0/16
-          - 172.20.0.0/16
-      - host: host.openshell.internal
-        port: 9090
-        access: full
-        allowed_ips:
-          - 172.17.0.0/16
-          - 172.18.0.0/16
-          - 172.20.0.0/16
-      - host: host.openshell.internal
-        port: 19530
-        access: full
-        allowed_ips:
-          - 172.17.0.0/16
-          - 172.18.0.0/16
-          - 172.20.0.0/16
-      - host: host.openshell.internal
-        port: 30081
-        access: full
-        allowed_ips:
-          - 172.17.0.0/16
-          - 172.18.0.0/16
-          - 172.20.0.0/16
-      - host: host.openshell.internal
-        port: 30082
         access: full
         allowed_ips:
           - 172.17.0.0/16
