@@ -292,6 +292,7 @@ async def run_agent() -> int:
     )
 
     manual_sweep = os.environ.get("MANUAL_FULL_SWEEP") == "1"
+    daily_run = os.environ.get("DAILY_RUN") == "true"
     pr_head = _require("PR_HEAD_SHA")
     pr_repo = _require("PR_REPO")
     run_id = os.environ.get("GITHUB_RUN_ID", f"local-{int(time.time())}")
@@ -309,6 +310,13 @@ async def run_agent() -> int:
         # worth scrubbing regardless of the upstream guard.
         skills_filter = os.environ.get("MANUAL_SKILLS_FILTER", "*").strip().splitlines()[0] if os.environ.get("MANUAL_SKILLS_FILTER", "").strip() else "*"
         step_summary = os.environ.get("GITHUB_STEP_SUMMARY", "")
+    elif daily_run:
+        pr_number = os.environ.get("PR_NUMBER", "") or f"manual-{run_id}"
+        pr_base = os.environ.get("PR_BASE", "") or "(daily-run)"
+        eval_kind = os.environ.get("EVAL_KIND", "eval")
+        eval_skill = _require("EVAL_SKILL")
+        eval_spec_path = os.environ.get("EVAL_SPEC_PATH", "")
+        eval_platform = os.environ.get("EVAL_PLATFORM", "")
     else:
         # Single-spec mode (push path): the `plan` job already resolved the
         # diff into one matrix leg, so this run evaluates exactly one
@@ -403,6 +411,36 @@ comment that the contributor must add the adapter and BLOCK instead.
 End with `BLOCKED: missing adapter for {eval_skill} auto-committed (<sha>)`
 once pushed, `BLOCKED: fork PR — adapter must be added by the contributor`
 for a fork, or `BLOCKED: <reason>` if you could not commit.
+"""
+    elif daily_run:
+        user_prompt = f"""
+Develop: evaluate exactly ONE spec on ONE platform —
+`{eval_spec_path}` (skill `{eval_skill}`, platform `{eval_platform or "see spec"}`).
+
+Context:
+  repo         = {pr_repo}
+  base branch  = develop
+  mirror head  = {pr_head}
+  workflow run = {run_id}
+  working dir  = {REPO_ROOT}
+  spec         = {eval_spec_path}
+  platform     = {eval_platform or "(read from spec)"}
+  leg slug     = {os.environ.get("EVAL_SLUG", "")}   (scratch scope; see § Per-leg scratch isolation)
+
+Per AGENTS.md § "Single-spec mode": SKIP step 1's diff — the `plan` job
+already selected this (spec, platform). Run steps 2–7 for it only:
+ensure/refresh its adapter under `.github/skill-eval/adapters/{eval_skill}/`
+(missing/stale → commit it to the PR branch per § 3c, then exit BLOCKED;
+the eval re-runs on sync — never run a locally-patched adapter in this leg)
+→ generate the dataset → acquire a per-box flock
+on a `vss-eval-*` member matching `{eval_platform or "the spec's platform"}` →
+run harbor synchronously for this platform (§ Harbor invocation; never
+background it) → gather results →
+post ONE PR comment for this spec (§ Result comment format). Do NOT touch
+any other spec or skill.
+
+End with `DONE: <reward summary>` after posting the comment, or
+`BLOCKED: <reason>` (e.g. stale adapter auto-committed, pool exhausted).
 """
     else:
         user_prompt = f"""
