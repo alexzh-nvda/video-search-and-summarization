@@ -18,7 +18,7 @@ global: {}
 
 image:
   repository: nvcr.io/nv-metropolis-dev/met-moe-agents/vss-agent
-  tag: "dev-e95a9f6644ed"
+  tag: "3.2.0-26.05.5-e95a9f6644ed"
   pullPolicy: IfNotPresent
 # Image must have mcp[cli] (typer) installed for `mcp serve` (same as Docker Compose).
 replicas: 1
